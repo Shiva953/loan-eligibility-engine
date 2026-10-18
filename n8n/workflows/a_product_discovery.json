@@ -1,0 +1,1295 @@
+{
+  "id": "lnWfProductDisc1",
+  "name": "A · Loan product discovery",
+  "nodes": [
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000101",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -320
+      ],
+      "parameters": {
+        "width": 1312,
+        "height": 256,
+        "content": "## A · Loan product discovery (S1 crawl-time compile + S6 confidence guard)\nDaily at 06:00, or run manually. For each source in `crawl_sources`, one at a time: check robots.txt → fetch pages → clean to structured text → SHA-256 → **unchanged? skip the LLM**. Otherwise extract through the LLM gateway → validate and compile rules in code → upsert with a criteria diff → close the crawl run.\n`crawl_mode=fixtures` (default) reads saved pages from the `fixtures` container. `live` fetches the real sites with our User-Agent and a pause between requests.\nEvery failure path closes that source's run as `error`, so one bad source never stops the others.\nLast, **Warm match cache** judges every cohort the active products can produce, so Workflow B finds them cached and makes no LLM call at match time.\n**A second run skips the LLM by design** (pages unchanged, cohorts cached). `make demo-reset` forgets one page's hash and the warm cache, so the next run takes every branch."
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000102",
+      "name": "Per-source error handling",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1504,
+        672
+      ],
+      "parameters": {
+        "width": 2560,
+        "height": 160,
+        "color": 3,
+        "content": "### Failure paths\nrobots.txt disallowed or unreachable · a page not 200 · the LLM failed or the budget is spent · validation threw · upsert failed. Each one becomes an item with `run_status` and `error`, and goes to **Finish crawl run**, which records it in `crawl_runs`. Then the loop moves on to the next source."
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000001",
+      "name": "Daily at 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        208
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000002",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        400
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000003",
+      "name": "Load app_config",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- First node of every workflow: all app_config switches as one JSON object (DECISIONS.md AD4).\n-- Later nodes read a value as $('Load app_config').first().json.config.email_mode, and so on.\n-- (No n8n expression braces in SQL files: the Postgres node evaluates them even inside comments.)\nSELECT jsonb_object_agg(key, value) AS config\nFROM app_config;\n",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000004",
+      "name": "Load sources",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        448,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow A: the enabled sources, one item each, in a stable order. robots_url is derived\n-- here so workflow expressions never have to parse URLs.\nSELECT source_id,\n       slug,\n       display_name,\n       kind,\n       page_urls,\n       fixture_files,\n       last_content_hash,\n       regexp_replace(page_urls[1], '^(https?://[^/]+).*$', '\\1') || '/robots.txt' AS robots_url\nFROM crawl_sources\nWHERE enabled\nORDER BY source_id;\n",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000005",
+      "name": "Loop over sources",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        672,
+        304
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000006",
+      "name": "Deactivate stale products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "executeOnce": true,
+      "position": [
+        896,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow A, after every source: products not seen for #1 days have left their page, so they\n-- stop being matched. Returns a single count row so the node always emits one item.\nWITH stale AS (\n    UPDATE loan_products\n    SET is_active = false\n    WHERE is_active\n      AND last_seen_at < now() - make_interval(days => $1::integer)\n    RETURNING product_id\n)\nSELECT count(*) AS products_deactivated FROM stale;\n",
+        "options": {
+          "queryReplacement": "={{ [ Number($('Load app_config').first().json.config.product_stale_days) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000007",
+      "name": "Crawl summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "executeOnce": true,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow A's final output: what this execution did, per source, plus totals.\n-- Parameter: #1 execution id.\nSELECT s.slug,\n       r.status,\n       r.http_status,\n       r.products_found,\n       r.llm_calls,\n       r.tokens_in,\n       r.tokens_out,\n       r.error,\n       (SELECT count(*) FROM loan_products p WHERE p.source_id = s.source_id AND p.is_active)\n           AS active_products\nFROM crawl_runs r\nJOIN crawl_sources s USING (source_id)\nWHERE r.execution_id = $1\nORDER BY s.source_id;\n",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000201",
+      "name": "Warm match cache",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1344,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "lnWfMatchWarm001",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000008",
+      "name": "Start crawl run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        896,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow A: open a crawl run for one source. It stays 'running' until finish_run.sql closes\n-- it, so a run that dies midway is visible. Parameters: #1 execution id, #2 source id, #3 mode.\nINSERT INTO crawl_runs (execution_id, source_id, mode)\nVALUES ($1, $2::integer, $3)\nRETURNING run_id, source_id, mode;\n",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id, $json.source_id, $('Load app_config').first().json.config.crawl_mode ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000009",
+      "name": "Fetch robots.txt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        304
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "url": "={{ $('Load app_config').first().json.config.crawl_mode === 'fixtures' ? 'http://fixtures/' + $('Loop over sources').first().json.slug + '/robots.txt' : $('Loop over sources').first().json.robots_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $('Load app_config').first().json.config.crawl_user_agent }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000010",
+      "name": "Plan page fetches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        304
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Plan page fetches\" (Workflow A). Mode: Run Once for All Items.\n//\n// Input: the robots.txt response for the current source (HTTP node, full response).\n// Output: one item per page to fetch, or a single { robots_blocked: true } item.\n//\n// robots.txt is honoured in both modes. In fixtures mode the saved robots.txt is checked\n// against the real page URLs, so a fixture run makes the same decision a live run would.\n// Matching follows RFC 9309: the group for our product token wins over \"*\", the longest\n// matching rule wins, Allow wins a tie, and \"*\" / \"$\" wildcards are supported. A 4xx\n// robots.txt means no restrictions. A 5xx or unreachable robots.txt means \"assume\n// disallowed\", as the RFC requires.\n\nfunction parseRobots(text) {\n  const groups = [];\n  let current = null;\n  let lastWasAgent = false;\n  for (const rawLine of text.split(/\\r?\\n/)) {\n    const line = rawLine.replace(/#.*$/, '').trim();\n    const match = line.match(/^([A-Za-z-]+)\\s*:\\s*(.*)$/);\n    if (!match) continue;\n    const field = match[1].toLowerCase();\n    const value = match[2].trim();\n    if (field === 'user-agent') {\n      if (!lastWasAgent) {\n        current = { agents: [], rules: [] };\n        groups.push(current);\n      }\n      current.agents.push(value.toLowerCase());\n      lastWasAgent = true;\n    } else if ((field === 'allow' || field === 'disallow') && current) {\n      if (value !== '') current.rules.push({ allow: field === 'allow', path: value });\n      lastWasAgent = false;\n    } else {\n      lastWasAgent = false;\n    }\n  }\n  return groups;\n}\n\nfunction ruleMatches(rulePath, path) {\n  const anchored = rulePath.endsWith('$');\n  const body = anchored ? rulePath.slice(0, -1) : rulePath;\n  const pattern = body\n    .split('*')\n    .map((part) => part.replace(/[.+?^${}()|[\\]\\\\]/g, '\\\\$&'))\n    .join('.*');\n  return new RegExp(`^${pattern}${anchored ? '$' : ''}`).test(path);\n}\n\n// The Code-node sandbox has no URL global, so the path and query are taken with a regex.\nfunction pathAndQuery(url) {\n  const match = String(url).match(/^[a-z][a-z0-9+.-]*:\\/\\/[^/?#]*([^#]*)/i);\n  const rest = match && match[1] ? match[1] : '/';\n  const withSlash = rest.startsWith('/') ? rest : `/${rest}`;\n  const queryAt = withSlash.indexOf('?');\n  const path = queryAt === -1 ? withSlash : withSlash.slice(0, queryAt);\n  const query = queryAt === -1 ? '' : withSlash.slice(queryAt);\n  try {\n    return decodeURIComponent(path) + query;\n  } catch {\n    return path + query;\n  }\n}\n\nfunction isAllowed(groups, productToken, url) {\n  const token = productToken.toLowerCase();\n  const own = groups.filter((g) => g.agents.some((a) => a !== '*' && token.startsWith(a)));\n  const chosen = own.length ? own : groups.filter((g) => g.agents.includes('*'));\n  const rules = chosen.flatMap((g) => g.rules);\n  const path = pathAndQuery(url);\n  let best = null;\n  for (const rule of rules) {\n    if (!ruleMatches(rule.path, path)) continue;\n    const longer = !best || rule.path.length > best.path.length;\n    const tieAllow = best && rule.path.length === best.path.length && rule.allow;\n    if (longer || tieAllow) best = rule;\n  }\n  return best ? best.allow : true;\n}\n\nfunction plan(source, config, robotsResponse) {\n  const userAgent = config.crawl_user_agent;\n  const productToken = userAgent.split('/')[0];\n  const status = robotsResponse.statusCode ?? 0;\n  if (status === 0) {\n    // Network failure, not a robots decision: log it as an error so it can be retried tomorrow.\n    return [{\n      robots_blocked: true,\n      run_status: 'error',\n      http_status: null,\n      error: `robots.txt unreachable: ${robotsResponse.error?.message ?? 'request failed'}`,\n    }];\n  }\n  let groups;\n  // HTTP Request with full response + text format puts the body in `data`.\n  if (status >= 200 && status < 300) groups = parseRobots(String(robotsResponse.data ?? ''));\n  else if (status >= 400 && status < 500) groups = [];\n  else groups = [{ agents: ['*'], rules: [{ allow: false, path: '/' }] }];\n\n  const fixtures = config.crawl_mode === 'fixtures';\n  const pages = source.page_urls.map((url, i) => ({\n    source_id: source.source_id,\n    slug: source.slug,\n    url,\n    fetch_url: fixtures ? `http://fixtures/${source.slug}/${source.fixture_files[i]}` : url,\n    user_agent: userAgent,\n  }));\n  const blocked = pages.filter((page) => !isAllowed(groups, productToken, page.url));\n  if (blocked.length) {\n    return [{\n      robots_blocked: true,\n      run_status: 'robots_blocked',\n      http_status: status,\n      error: `robots.txt disallows ${blocked.map((p) => p.url).join(', ')}`,\n    }];\n  }\n  return pages.map((page) => ({ robots_blocked: false, ...page }));\n}\n\n// ---- n8n entry point ----\nconst source = $('Loop over sources').first().json;\nconst config = $('Load app_config').first().json.config;\nreturn plan(source, config, $input.first().json).map((json) => ({ json }));\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000011",
+      "name": "Allowed by robots?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1568,
+        304
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c1",
+              "leftValue": "={{ $json.robots_blocked }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000012",
+      "name": "Fetch pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1792,
+        208
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "url": "={{ $json.fetch_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $json.user_agent }}"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html,*/*;q=0.8"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": "={{ $('Load app_config').first().json.config.crawl_mode === 'live' ? Number($('Load app_config').first().json.config.crawl_delay_seconds) * 1000 : 0 }}"
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000013",
+      "name": "Collect pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        208
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Collect pages\" (Workflow A). Mode: Run Once for All Items.\n//\n// Joins the per-page HTTP responses back into one item for the source. Pages are paired with\n// their plan by position, which the HTTP Request node preserves. A source is only extracted\n// when every page came back 200: a partial source would make products look removed and\n// deactivate them a week later.\n\nfunction collect(source, plans, responses) {\n  const pages = plans.map((planned, i) => ({\n    url: planned.url,\n    status: responses[i]?.statusCode ?? 0,\n    // HTTP Request with full response + text format puts the body in `data`.\n    body: typeof responses[i]?.data === 'string' ? responses[i].data : '',\n    error: responses[i]?.error?.message ?? null,\n  }));\n  const failed = pages.find((page) => page.status !== 200);\n  if (failed) {\n    return {\n      fetch_ok: false,\n      run_status: 'error',\n      http_status: failed.status || null,\n      error: failed.status ? `HTTP ${failed.status} for ${failed.url}` : `${failed.url}: ${failed.error ?? 'request failed'}`,\n    };\n  }\n  return {\n    fetch_ok: true,\n    source_id: source.source_id,\n    slug: source.slug,\n    display_name: source.display_name,\n    kind: source.kind,\n    http_status: 200,\n    pages: pages.map(({ url, body }) => ({ url, body })),\n  };\n}\n\n// ---- n8n entry point ----\nconst source = $('Loop over sources').first().json;\nconst plans = $('Plan page fetches').all().map((item) => item.json);\nconst responses = $input.all().map((item) => item.json);\nreturn [{ json: collect(source, plans, responses) }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000014",
+      "name": "Pages fetched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2240,
+        208
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c2",
+              "leftValue": "={{ $json.fetch_ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000015",
+      "name": "Clean page text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        112
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Clean page text\" (Workflow A). Mode: Run Once for All Items.\n//\n// Turns each fetched page into compact, structure-preserving text before hashing and\n// extraction. Why not n8n's HTML node: the source pages have no <main> element and use\n// generated IDs, so CSS selectors would break on the next redeploy. Plain text extraction\n// would also flatten the rate and eligibility tables the LLM most needs. This cleaner keeps\n// table rows as \"cell | cell\" lines and headings as \"##\" lines, and drops chrome\n// (scripts, nav, header, footer, forms) and duplicate lines.\n//\n// The hash is taken over this text, not the raw HTML, so cosmetic markup changes (tracking\n// IDs, build hashes) don't trigger a new LLM extraction.\n//\n// Input items:  { source_id, slug, pages: [{ url, body }] }\n// Output items: { ...input without page bodies, text, text_chars, raw_chars }\n\nconst DROP_BLOCKS = [\n  'script', 'style', 'noscript', 'svg', 'head', 'nav', 'header', 'footer',\n  'form', 'iframe', 'button', 'select', 'template',\n];\n\nconst NAMED_ENTITIES = {\n  amp: '&', lt: '<', gt: '>', quot: '\"', apos: \"'\", nbsp: ' ', ndash: '-', mdash: '-',\n  rsquo: \"'\", lsquo: \"'\", rdquo: '\"', ldquo: '\"', hellip: '...', bull: '-', middot: '-',\n  rupee: '₹', inr: '₹', times: 'x', percnt: '%',\n};\n\nfunction decodeEntities(text) {\n  return text.replace(/&(#x[0-9a-f]+|#\\d+|[a-z]+);/gi, (match, code) => {\n    if (code[0] === '#') {\n      const value = code[1].toLowerCase() === 'x' ? parseInt(code.slice(2), 16) : parseInt(code.slice(1), 10);\n      return Number.isFinite(value) ? String.fromCodePoint(value) : match;\n    }\n    const named = NAMED_ENTITIES[code.toLowerCase()];\n    return named === undefined ? match : named;\n  });\n}\n\nfunction htmlToText(html) {\n  let s = html.replace(/<!--[\\s\\S]*?-->/g, ' ');\n  for (const tag of DROP_BLOCKS) {\n    s = s.replace(new RegExp(`<${tag}\\\\b[\\\\s\\\\S]*?</${tag}>`, 'gi'), ' ');\n  }\n  // Each table row becomes one \"cell | cell\" line. Cells often wrap their text in <p> or <div>,\n  // which would otherwise split a row across lines and detach a lender's name from its rate.\n  s = s.replace(/<tr\\b[^>]*>([\\s\\S]*?)<\\/tr>/gi, (_, row) => {\n    const cells = row\n      .split(/<\\/t[dh]>/i)\n      .map((cell) => cell.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim())\n      .filter(Boolean);\n    return `\\n${cells.join(' | ')}\\n`;\n  });\n  s = s\n    .replace(/<h[1-6]\\b[^>]*>/gi, '\\n## ')\n    .replace(/<li\\b[^>]*>/gi, '\\n- ')\n    .replace(/<(br|p|div|section|article|ul|ol|table|tr|dt|dd)\\b[^>]*>/gi, '\\n')\n    .replace(/<\\/(p|div|section|article|ul|ol|table|tr|li|dt|dd|h[1-6])>/gi, '\\n')\n    .replace(/<[^>]+>/g, ' ');\n  // Some CMSs (HDFC's included) ship entity-escaped HTML as text. Decoding reveals that markup,\n  // so strip tags a second time and decode again.\n  s = decodeEntities(decodeEntities(s).replace(/<[^>]+>/g, ' '));\n\n  const lines = s\n    .split('\\n')\n    .map((raw) =>\n      raw\n        .replace(/[ \\t ]+/g, ' ')\n        .replace(/(\\s*\\|\\s*)+$/, '')\n        .replace(/^(\\s*\\|\\s*)+/, '')\n        .trim(),\n    )\n    .filter((line) => line.length >= 2 && !/^[-#|\\s]+$/.test(line));\n\n  // Menus go first: if they were deduplicated first, a menu entry such as \"SBI Personal Loan\"\n  // would knock out the real heading or table row with the same text further down.\n  const seen = new Set();\n  const kept = [];\n  for (const line of dropLinkFarms(lines)) {\n    // Dedupe on the content, so \"- Age: 21 to 60\" and \"Age: 21 to 60\" count as one line.\n    const key = line.replace(/^(- |## )/, '').toLowerCase();\n    if (seen.has(key)) continue;\n    seen.add(key);\n    kept.push(line);\n  }\n  return kept.join('\\n');\n}\n\n// Mega-menus survive outside <nav> as long runs of short bullets (\"- Car Loan\", \"- PMAY\").\n// Eligibility bullets almost always carry a number, a percentage or a rupee amount, so a run\n// of 4+ short bullets with none of those is navigation and is dropped.\nconst HAS_FIGURE = /[0-9%₹]/;\nfunction dropLinkFarms(lines) {\n  const out = [];\n  let run = [];\n  const flush = () => {\n    if (run.length < 4) out.push(...run);\n    run = [];\n  };\n  for (const line of lines) {\n    const isMenuLike = line.startsWith('- ') && line.length <= 40 && !HAS_FIGURE.test(line);\n    if (isMenuLike) {\n      run.push(line);\n    } else {\n      flush();\n      out.push(line);\n    }\n  }\n  flush();\n  return out;\n}\n\nfunction cleanSource(item) {\n  const pages = item.pages || [];\n  const sections = pages.map((page) => `=== PAGE: ${page.url} ===\\n${htmlToText(page.body || '')}`);\n  const text = sections.join('\\n\\n');\n  const { pages: _dropped, ...rest } = item;\n  return {\n    ...rest,\n    page_urls: pages.map((page) => page.url),\n    text,\n    text_chars: text.length,\n    raw_chars: pages.reduce((sum, page) => sum + (page.body || '').length, 0),\n  };\n}\n\n// ---- n8n entry point ----\nreturn $input.all().map((item) => ({ json: cleanSource(item.json) }));\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000016",
+      "name": "Hash page text",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        112
+      ],
+      "parameters": {
+        "action": "hash",
+        "type": "SHA256",
+        "value": "={{ $json.text }}",
+        "dataPropertyName": "content_hash",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000017",
+      "name": "Page changed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2912,
+        112
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c3",
+              "leftValue": "={{ $json.content_hash !== $('Loop over sources').first().json.last_content_hash }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000018",
+      "name": "Mark unchanged",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3136,
+        304
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a1",
+              "name": "run_status",
+              "value": "unchanged",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a2",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000019",
+      "name": "Build extraction request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        16
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Build extraction request\" (Workflow A). Mode: Run Once for All Items.\n//\n// S1, crawl-time compile: the page text goes to the LLM once per changed page, together with a\n// strict JSON schema. The model reports values as stated on the page (amounts with their\n// period, rates as written), a confidence per field group, and every remaining criterion\n// classified as compilable, fuzzy or unknown_field. Unit conversion and every threshold\n// decision happen afterwards in validate_products.js, as code, so the LLM never does\n// arithmetic the engine depends on.\n//\n// The request is provider-neutral. The LLM gateway sub-workflow turns it into a Gemini (or\n// other provider) call.\n\nconst PROMPT_VERSION = 'extract-v3';\nconst FACTS = ['monthly_income', 'credit_score', 'employment_status', 'age'];\nconst EMPLOYMENT = ['Salaried', 'Self-Employed', 'Business'];\n\nconst SYSTEM = `You extract personal-loan products and their eligibility rules from the text of an Indian lender or loan-comparison web page. Your output feeds an eligibility engine that knows only four facts about each applicant:\n- monthly_income: net monthly income in INR\n- credit_score: CIBIL score, 300 to 900\n- employment_status: exactly one of \"Salaried\", \"Self-Employed\", \"Business\"\n- age: in years\n\nRules:\n1. Return one product per distinct lender product that the page describes with at least an interest rate or an eligibility rule. Comparison pages list many lenders: every lender with its own row in a rate table or an eligibility table is a product, even if it has no other mention, and everything the page says about the same lender (rate table row, eligibility table row, lender card) is merged into that one product. Ignore navigation, links, other loan types (home, car, gold, business, education loans) and generic advice that is not tied to a lender.\n2. lender is the lender's usual name, such as \"HDFC Bank\" or \"Aditya Birla Capital\". product_name is the product as the page names it, such as \"HDFC Personal Loan\".\n3. Interest rates are percent per annum, copied as stated. \"10.99% p.a. onwards\" means min 10.99 and max null.\n4. List every stated minimum income in income_thresholds: amount in rupees as a plain number, and the period as written. \"Rs.25,000 per month\" is 25000 monthly. \"Rs 5 lakh per annum\" is 500000 annual. 1 lakh = 100000 and 1 crore = 10000000. employment lists the groups the threshold applies to (empty means everyone). Put any other condition, such as holding a salary account with the bank or working for a particular employer, in condition.\n5. employment_allowed lists only groups the page clearly allows for this product. \"salaried\" maps to \"Salaried\". \"self-employed\" with no qualifier maps to \"Self-Employed\". \"business owner\" or \"self-employed non-professional\" maps to \"Business\". If the page says self-employed applicants are not eligible, list only \"Salaried\". If a group is described more narrowly than these three values (for example \"self-employed professionals such as doctors and CAs\", or \"employees of private limited companies\"), do not list it here. Add it to other_criteria instead. Leave employment_allowed empty when the page does not say.\n6. credit_score_kind is \"minimum\" when the page states a score an applicant needs, must have or must meet for this lender, such as \"you need a minimum credit score of 720\", \"CIBIL score: 685 or higher\", \"750 or more\" or \"at least 700\". A stated requirement wins: if the page states a required score and elsewhere calls a score good, ideal or preferred, report the lowest required score with kind \"minimum\", and put the preferred score in other_criteria as compilable. Use \"preferred\" only when the page states no required score and only calls a score good, ideal or preferred. Otherwise use \"not_stated\", with min_credit_score null.\n7. other_criteria holds every other eligibility condition for this product, each classified:\n   - \"compilable\": can be checked with the four facts and an exact threshold, such as \"CIBIL 750 or above preferred\" or \"minimum income Rs 40,000 for self-employed\".\n   - \"fuzzy\": depends only on the four facts but needs judgment to apply, such as \"self-employed professionals\" against employment_status \"Self-Employed\".\n   - \"unknown_field\": depends on information the engine does not have, such as employer category, work experience, city, residence stability, a relationship with the bank, loan amount or existing debt.\n   depends_on lists the facts involved. It is empty for unknown_field.\n8. confidence, per field group: 1 when stated explicitly for this product; about 0.5 when inferred, ambiguous, or when two places on the page give this lender different values (then use the value from the lender's own card or section, and still say 0.5); 0 when not stated.\n9. evidence is one short quote, under 200 characters, that supports the product's rules.\nReturn only products the text supports.`;\n\nconst NULLABLE_NUMBER = { type: ['number', 'null'] };\nconst NULLABLE_INTEGER = { type: ['integer', 'null'] };\nconst CONFIDENCE = { type: 'number', minimum: 0, maximum: 1 };\n\nconst SCHEMA = {\n  type: 'object',\n  properties: {\n    products: {\n      type: 'array',\n      items: {\n        type: 'object',\n        properties: {\n          lender: { type: 'string' },\n          product_name: { type: 'string' },\n          interest_rate_min_pct: NULLABLE_NUMBER,\n          interest_rate_max_pct: NULLABLE_NUMBER,\n          min_age: NULLABLE_INTEGER,\n          max_age: NULLABLE_INTEGER,\n          min_credit_score: NULLABLE_INTEGER,\n          credit_score_kind: { type: 'string', enum: ['minimum', 'preferred', 'not_stated'] },\n          income_thresholds: {\n            type: 'array',\n            items: {\n              type: 'object',\n              properties: {\n                amount: { type: 'number' },\n                period: { type: 'string', enum: ['monthly', 'annual'] },\n                employment: { type: 'array', items: { type: 'string', enum: EMPLOYMENT } },\n                condition: { type: ['string', 'null'] },\n              },\n              required: ['amount', 'period', 'employment', 'condition'],\n              additionalProperties: false,\n            },\n          },\n          employment_allowed: { type: 'array', items: { type: 'string', enum: EMPLOYMENT } },\n          other_criteria: {\n            type: 'array',\n            items: {\n              type: 'object',\n              properties: {\n                text: { type: 'string' },\n                class: { type: 'string', enum: ['compilable', 'fuzzy', 'unknown_field'] },\n                depends_on: { type: 'array', items: { type: 'string', enum: FACTS } },\n              },\n              required: ['text', 'class', 'depends_on'],\n              additionalProperties: false,\n            },\n          },\n          confidence: {\n            type: 'object',\n            properties: {\n              interest_rate: CONFIDENCE,\n              age: CONFIDENCE,\n              credit_score: CONFIDENCE,\n              income: CONFIDENCE,\n              employment: CONFIDENCE,\n            },\n            required: ['interest_rate', 'age', 'credit_score', 'income', 'employment'],\n            additionalProperties: false,\n          },\n          evidence: { type: 'string' },\n        },\n        required: [\n          'lender', 'product_name', 'interest_rate_min_pct', 'interest_rate_max_pct',\n          'min_age', 'max_age', 'min_credit_score', 'credit_score_kind', 'income_thresholds',\n          'employment_allowed', 'other_criteria', 'confidence', 'evidence',\n        ],\n        additionalProperties: false,\n      },\n    },\n  },\n  required: ['products'],\n  additionalProperties: false,\n};\n\nfunction buildRequest(source, config) {\n  return {\n    purpose: 'extract_products',\n    prompt_version: PROMPT_VERSION,\n    model: config.llm_model_extract,\n    temperature: 0,\n    max_output_tokens: 32768,\n    system: SYSTEM,\n    prompt: `Source: ${source.display_name} (${source.kind})\\n\\n${source.text}`,\n    schema: SCHEMA,\n  };\n}\n\n// ---- n8n entry point ----\nconst config = $('Load app_config').first().json.config;\nreturn [{ json: buildRequest($input.first().json, config) }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000020",
+      "name": "Extract with LLM",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        3360,
+        16
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "lnWfLlmGateway01",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000021",
+      "name": "Extraction ok?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3584,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c4",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000022",
+      "name": "Mark extraction failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3808,
+        304
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a3",
+              "name": "run_status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a4",
+              "name": "error",
+              "value": "={{ 'extraction failed: ' + ($json.message ?? $json.error?.message ?? $json.error ?? 'unknown') }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a5",
+              "name": "content_hash",
+              "value": "={{ $('Hash page text').first().json.content_hash }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a6",
+              "name": "llm_calls",
+              "value": "={{ $json.calls ?? 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a7",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000023",
+      "name": "Validate products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3808,
+        -96
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "jsCode": "// Code node \"Validate products\" (Workflow A). Mode: Run Once for All Items.\n//\n// Turns the LLM's page-level extraction into the hard-filter columns of loan_products (S1) and\n// applies the confidence guard (S6). Everything that decides who is filtered out happens here,\n// in code that can be tested, never in the model:\n//   * Ranges: rates must be in (0, 60] % p.a., ages in 18-100, scores in 300-900. Swapped\n//     min/max values are put back in order.\n//   * Income: annual amounts become monthly (divide by 12). The lowest threshold for anyone\n//     becomes the SQL filter, so nobody is wrongly excluded. Stricter employment-specific\n//     thresholds become `compilable` rules. Thresholds that depend on something we don't know\n//     (salary account, employer) become `unknown_field` caveats.\n//   * Credit score: only a stated minimum filters. A \"preferred\" score becomes a `compilable`\n//     ranking rule. On a lender's own page, code also reads the text: a sentence that states a\n//     score as a requirement (\"you need a minimum credit score of 720\", \"CIBIL Score: 685 or\n//     higher\") sets the minimum, even if the model called it preferred. The lowest stated\n//     requirement wins. On an aggregator page the stated requirement is the source's general\n//     one (\"Credit Score | CIBIL score of 750 or more\"); it applies to each listed product that\n//     states criteria of its own but no score. A sentence about what lenders will \"consider\" is\n//     not an eligibility bar and is skipped.\n//   * Income tiers reserved for a relationship we can't verify (the bank's own employees, its\n//     salary-account holders, existing customers) don't set the floor; they stay caveats. The\n//     floor is the general public's tier.\n//   * S6: a hard-filter field whose confidence is below extraction_confidence_min is not used\n//     as a filter (stored as NULL). It becomes a `fuzzy` criterion instead, so that product's\n//     pairs go to the LLM with the stated value rather than being decided by an untrusted\n//     rule.\n//   * criteria_hash covers the decision-relevant criteria only (no confidences, no evidence),\n//     so it changes exactly when matching could change.\n\nconst crypto = require('crypto');\n\nconst EMPLOYMENT = ['Salaried', 'Self-Employed', 'Business'];\nconst FACTS = ['monthly_income', 'credit_score', 'employment_status', 'age'];\nconst CLASSES = ['compilable', 'fuzzy', 'unknown_field'];\nconst MAX_MONTHLY_INCOME = 10000000;\nconst SUSPICIOUS_MONTHLY = 500000;\n\nfunction num(value) {\n  const n = typeof value === 'string' ? Number(value.replace(/,/g, '')) : value;\n  return typeof n === 'number' && Number.isFinite(n) ? n : null;\n}\n\nfunction text(value) {\n  return typeof value === 'string' ? value.replace(/\\s+/g, ' ').trim() : '';\n}\n\nfunction rupees(n) {\n  return `₹${Math.round(n).toLocaleString('en-IN')}`;\n}\n\nfunction canonical(value) {\n  if (Array.isArray(value)) return value.map(canonical);\n  if (value && typeof value === 'object') {\n    return Object.fromEntries(Object.keys(value).sort().map((k) => [k, canonical(value[k])]));\n  }\n  return value;\n}\n\nfunction sha256(value) {\n  return crypto.createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');\n}\n\nfunction rates(raw, issues) {\n  let min = num(raw.interest_rate_min_pct);\n  let max = num(raw.interest_rate_max_pct);\n  for (const [name, value] of [['min', min], ['max', max]]) {\n    if (value !== null && !(value > 0 && value <= 60)) {\n      issues.push(`interest rate ${name} ${value}% is outside (0, 60]: dropped`);\n      if (name === 'min') min = null;\n      else max = null;\n    }\n  }\n  if (min !== null && max !== null && min > max) {\n    issues.push(`interest rate min ${min} > max ${max}: swapped`);\n    [min, max] = [max, min];\n  }\n  return { interest_rate_min: min, interest_rate_max: max };\n}\n\nfunction ages(raw, issues) {\n  let min = num(raw.min_age);\n  let max = num(raw.max_age);\n  if (min !== null && !(min >= 18 && min <= 100)) { issues.push(`min age ${min} out of range: dropped`); min = null; }\n  if (max !== null && !(max >= 18 && max <= 100)) { issues.push(`max age ${max} out of range: dropped`); max = null; }\n  if (min !== null && max !== null && min > max) {\n    issues.push(`min age ${min} > max age ${max}: both dropped`);\n    return { min_age: null, max_age: null };\n  }\n  return { min_age: min, max_age: max };\n}\n\nconst SCORE_MENTION = /\\b(?:credit|cibil)\\s+score\\b/i;\nconst SCORE_REQUIRED = /\\b(?:minimum|at least|need|needs|required|requires|must|eligible)\\b|\\bor (?:higher|more|above)\\b|\\band above\\b/i;\nconst SCORE_PREFERRED = /\\b(?:good|ideal|prefer|preferred|generally|recommended|better|improves?|likely|chances|typically|consider|considered)\\b/i;\n\n/** The lowest credit score a page states as a requirement, or null: the text, read by code. */\nfunction statedMinimumScore(pageText) {\n  let lowest = null;\n  for (const sentence of String(pageText || '').split(/(?<=[.?!])\\s+|\\n+|\\s\\|\\s/)) {\n    if (!SCORE_MENTION.test(sentence) || !SCORE_REQUIRED.test(sentence) || SCORE_PREFERRED.test(sentence)) continue;\n    for (const match of sentence.matchAll(/\\b([3-9]\\d{2})\\b/g)) {\n      const value = Number(match[1]);\n      if (value >= 300 && value <= 900 && (lowest === null || value < lowest)) lowest = value;\n    }\n  }\n  return lowest;\n}\n\nfunction creditScore(raw, issues, soft, pageMinimum) {\n  const score = num(raw.min_credit_score);\n  let minimum = null;\n  if (score !== null && raw.credit_score_kind !== 'not_stated') {\n    if (!(score >= 300 && score <= 900)) {\n      issues.push(`credit score ${score} out of 300-900: dropped`);\n    } else if (raw.credit_score_kind === 'preferred') {\n      soft.push({\n        text: `Credit score ${score}+ preferred`,\n        class: 'compilable',\n        depends_on: ['credit_score'],\n        origin: 'preferred_score',\n        rule: { field: 'credit_score', op: '>=', value: score, effect: 'rank' },\n      });\n    } else {\n      minimum = Math.round(score);\n    }\n  }\n  if (pageMinimum !== null && (minimum === null || pageMinimum < minimum)) {\n    issues.push(`the page states a minimum credit score of ${pageMinimum}: used as the filter`);\n    return { min_credit_score: pageMinimum, score_from_page: true };\n  }\n  return { min_credit_score: minimum };\n}\n\nconst CONCESSION = /\\b(?:employees?|staff|salary account|account holders?|corp(?:orate)? salary|existing customers?|pre-?approved)\\b/i;\nconst isConcession = (condition) => Boolean(condition) && CONCESSION.test(condition) && !/\\bnon[- ]/i.test(condition);\n\nfunction income(raw, issues, soft, confidence) {\n  const thresholds = [];\n  for (const t of Array.isArray(raw.income_thresholds) ? raw.income_thresholds : []) {\n    const amount = num(t.amount);\n    if (amount === null || amount <= 0) continue;\n    const monthly = t.period === 'annual' ? Math.round(amount / 12) : amount;\n    if (monthly > MAX_MONTHLY_INCOME) {\n      issues.push(`income ${rupees(monthly)}/month is implausible: dropped`);\n      continue;\n    }\n    if (t.period !== 'annual' && monthly >= SUSPICIOUS_MONTHLY) {\n      issues.push(`monthly income ${rupees(monthly)} looks annual: confidence lowered`);\n      confidence.min_monthly_income = Math.min(confidence.min_monthly_income, 0.4);\n    }\n    const employment = [...new Set((t.employment || []).filter((e) => EMPLOYMENT.includes(e)))];\n    thresholds.push({ monthly, employment, condition: text(t.condition) || null });\n  }\n  if (!thresholds.length) return { min_monthly_income: null };\n\n  const general = thresholds.filter((t) => !isConcession(t.condition));\n  const floor = Math.min(...(general.length ? general : thresholds).map((t) => t.monthly));\n  for (const t of thresholds) {\n    if (t.condition) {\n      soft.push({\n        text: `Minimum income ${rupees(t.monthly)}/month ${t.condition}`.replace(/\\s+/g, ' '),\n        class: 'unknown_field',\n        depends_on: [],\n        origin: 'income_tier',\n      });\n    } else if (t.monthly > floor && t.employment.length && t.employment.length < EMPLOYMENT.length) {\n      soft.push({\n        text: `Minimum income ${rupees(t.monthly)}/month for ${t.employment.join(' / ')}`,\n        class: 'compilable',\n        depends_on: ['monthly_income', 'employment_status'],\n        origin: 'income_tier',\n        rule: { field: 'monthly_income', op: '>=', value: t.monthly, when: { employment_status: t.employment } },\n      });\n    } else if (t.monthly > floor) {\n      issues.push(`conflicting unconditional income thresholds; using the lowest, ${rupees(floor)}`);\n      confidence.min_monthly_income = Math.min(confidence.min_monthly_income, 0.5);\n    }\n  }\n  return { min_monthly_income: floor };\n}\n\nfunction employmentAllowed(raw) {\n  const allowed = [...new Set((raw.employment_allowed || []).filter((e) => EMPLOYMENT.includes(e)))];\n  if (!allowed.length || allowed.length === EMPLOYMENT.length) return { allowed_employment: null };\n  return { allowed_employment: EMPLOYMENT.filter((e) => allowed.includes(e)) };\n}\n\nfunction otherCriteria(raw, issues, soft) {\n  for (const c of Array.isArray(raw.other_criteria) ? raw.other_criteria : []) {\n    const body = text(c.text);\n    if (!body) continue;\n    let cls = CLASSES.includes(c.class) ? c.class : 'unknown_field';\n    let dependsOn = [...new Set((c.depends_on || []).filter((f) => FACTS.includes(f)))];\n    if (cls === 'unknown_field') dependsOn = [];\n    if (cls !== 'unknown_field' && !dependsOn.length) {\n      issues.push(`\"${body}\" is ${cls} but depends on none of our fields: treated as unknown_field`);\n      cls = 'unknown_field';\n    }\n    soft.push({ text: body, class: cls, depends_on: dependsOn, origin: 'page' });\n  }\n}\n\n// S6: a hard filter the extraction is unsure about is not used as a filter.\nconst GUARDED = [\n  { field: 'min_monthly_income', fact: 'monthly_income', label: 'Minimum monthly income', show: rupees },\n  { field: 'min_credit_score', fact: 'credit_score', label: 'Minimum credit score', show: String },\n  { field: 'allowed_employment', fact: 'employment_status', label: 'Eligible employment', show: (v) => v.join(', ') },\n];\n\nfunction confidenceGuard(columns, confidence, threshold, issues, soft) {\n  for (const { field, fact, label, show } of GUARDED) {\n    if (columns[field] !== null && confidence[field] < threshold) {\n      soft.push({\n        text: `${label} stated as ${show(columns[field])} (extraction confidence ${confidence[field]})`,\n        class: 'fuzzy',\n        depends_on: [fact],\n        origin: 'low_confidence',\n      });\n      issues.push(`${field} confidence ${confidence[field]} < ${threshold}: not used as a filter`);\n      columns[field] = null;\n    }\n  }\n  const ageConfident = confidence.age >= threshold;\n  if (!ageConfident && (columns.min_age !== null || columns.max_age !== null)) {\n    soft.push({\n      text: `Age ${columns.min_age ?? '?'}-${columns.max_age ?? '?'} years (extraction confidence ${confidence.age})`,\n      class: 'fuzzy',\n      depends_on: ['age'],\n      origin: 'low_confidence',\n    });\n    issues.push(`age confidence ${confidence.age} < ${threshold}: not used as a filter`);\n    columns.min_age = null;\n    columns.max_age = null;\n  }\n}\n\nfunction normalizeProduct(raw, sourceUrl, threshold, pageMinimum = null, generalMinimum = null) {\n  const issues = [];\n  const lender = text(raw.lender);\n  const productName = text(raw.product_name);\n  if (!lender || !productName) return { product: null, issues: ['product without lender or name: dropped'] };\n\n  const c = raw.confidence || {};\n  const clamp = (v) => Math.round(Math.min(1, Math.max(0, num(v) ?? 0)) * 100) / 100;\n  const confidence = {\n    interest_rate: clamp(c.interest_rate),\n    age: clamp(c.age),\n    min_credit_score: clamp(c.credit_score),\n    min_monthly_income: clamp(c.income),\n    allowed_employment: clamp(c.employment),\n  };\n\n  const soft = [];\n  const { score_from_page: scoreFromPage, ...score } = creditScore(raw, issues, soft, pageMinimum);\n  if (scoreFromPage) confidence.min_credit_score = 1; // read from the page text by code\n  const columns = {\n    ...rates(raw, issues),\n    ...ages(raw, issues),\n    ...score,\n    ...income(raw, issues, soft, confidence),\n    ...employmentAllowed(raw),\n  };\n  otherCriteria(raw, issues, soft);\n  const ownCriteria = ['min_age', 'max_age', 'min_monthly_income'].some((f) => columns[f] !== null)\n    || (columns.allowed_employment ?? []).length > 0\n    || soft.some((c) => c.class === 'fuzzy' || c.class === 'compilable');\n  if (columns.min_credit_score === null && generalMinimum !== null && ownCriteria) {\n    columns.min_credit_score = generalMinimum;\n    confidence.min_credit_score = 1; // read from the page text by code\n    issues.push(`no score of its own: the source's general requirement, ${generalMinimum}, applies`);\n  }\n  confidenceGuard(columns, confidence, threshold, issues, soft);\n\n  const seen = new Set();\n  const softCriteria = soft\n    .filter((s) => (seen.has(s.text.toLowerCase()) ? false : seen.add(s.text.toLowerCase())))\n    .sort((a, b) => a.class.localeCompare(b.class) || a.text.localeCompare(b.text));\n  const criteria = { ...columns, soft_criteria: softCriteria };\n\n  return {\n    product: {\n      lender,\n      product_name: productName,\n      source_url: sourceUrl,\n      ...columns,\n      soft_criteria: softCriteria,\n      field_confidence: confidence,\n      criteria_json: canonical(criteria),\n      criteria_hash: sha256(criteria),\n    },\n    issues: issues.map((i) => `${productName}: ${i}`),\n  };\n}\n\nconst hardFieldCount = (p) =>\n  ['min_age', 'max_age', 'min_credit_score', 'min_monthly_income', 'allowed_employment', 'interest_rate_min']\n    .filter((f) => p[f] !== null).length;\n\n// One lender can appear under its full name and its acronym on the same page (\"IIFL\" and\n// \"India Infoline Finance Ltd.\"), or a product under the lender's initials (\"PNB Personal\n// Loan\"). Two entries are the same product when their lenders match by name or acronym (a\n// single-word name equal to the other's initials) and their product names match once lender\n// words, initials and generic words are removed.\nconst words = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim().split(' ').filter(Boolean);\nconst GENERIC = new Set(['bank', 'ltd', 'limited', 'finance', 'financial', 'services', 'powered', 'by']);\n\nfunction lenderForms(lender) {\n  const w = words(lender);\n  return {\n    core: w.filter((x) => !['bank', 'ltd', 'limited'].includes(x)).join(' '),\n    initials: w.map((x) => x[0]).join(''),\n    single: w.length === 1 ? w[0] : null,\n  };\n}\n\nfunction sameLender(a, b) {\n  const x = lenderForms(a);\n  const y = lenderForms(b);\n  return x.core === y.core || (x.single !== null && x.single === y.initials)\n    || (y.single !== null && y.single === x.initials);\n}\n\n// The product name without either lender's words or initials, so \"PNB Personal Loan\" and\n// \"Punjab National Bank Personal Loan\" compare equal.\nfunction productCore(p, otherLender) {\n  const drop = new Set([...words(p.lender), ...words(otherLender), lenderForms(p.lender).initials,\n                        lenderForms(otherLender).initials, ...GENERIC]);\n  return words(p.product_name).filter((x) => !drop.has(x)).join(' ');\n}\n\nfunction validate(extraction, sourceUrl, threshold, pageMinimum = null, generalMinimum = null) {\n  const kept = [];\n  const issues = [];\n  let dropped = 0;\n  for (const raw of Array.isArray(extraction?.products) ? extraction.products : []) {\n    const { product, issues: productIssues } = normalizeProduct(raw, sourceUrl, threshold, pageMinimum, generalMinimum);\n    issues.push(...productIssues);\n    if (!product) { dropped += 1; continue; }\n    const at = kept.findIndex((k) => sameLender(k.lender, product.lender)\n      && productCore(k, product.lender) === productCore(product, k.lender));\n    if (at === -1) { kept.push(product); continue; }\n    issues.push(`${product.product_name}: same product as ${kept[at].product_name}, kept the more complete entry`);\n    dropped += 1;\n    if (hardFieldCount(product) > hardFieldCount(kept[at])) kept[at] = product;\n  }\n  return { products: kept, issues, dropped };\n}\n\n// ---- n8n entry point ----\nconst gateway = $input.first().json;\nconst source = $('Loop over sources').first().json;\nconst page = $('Hash page text').first().json;\nconst config = $('Load app_config').first().json.config;\nconst threshold = Number(config.extraction_confidence_min);\nconst stated = statedMinimumScore(page.text);\nconst pageMinimum = source.kind === 'lender' ? stated : null; // the lender's own minimum\nconst generalMinimum = source.kind === 'aggregator' ? stated : null; // the source's general one\nconst { products, issues, dropped } = validate(gateway.data, source.page_urls[0], threshold, pageMinimum, generalMinimum);\nreturn [{\n  json: {\n    products,\n    products_found: products.length,\n    products_dropped: dropped,\n    issues,\n    content_hash: page.content_hash,\n    llm_calls: gateway.calls,\n    tokens_in: gateway.tokens_in,\n    tokens_out: gateway.tokens_out,\n  },\n}];\n"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000024",
+      "name": "Upsert products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4032,
+        -96
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow A: upsert one source's validated products in a single statement, and record a\n-- criteria diff for every product that is new or whose criteria changed.\n--\n-- Parameters:\n--   #1  products: JSON array produced by n8n/code/validate_products.js\n--   #2  source_id\n--   #3  crawl run id (links the history rows to the run that saw the change)\n--   #4  content hash of the cleaned page text\n--\n-- Every CTE sees the same snapshot, so `previous` holds the criteria from before this upsert.\n-- A product whose criteria change gets needs_review = true until someone clears it. A first\n-- sighting writes a history row with old_criteria NULL, so every product has a starting point\n-- for later diffs.\n--\n-- Products are matched on their identity within the source (lender + name, normalised:\n-- migration 010), not the exact wording, so a re-extraction that names a product differently\n-- updates it (and takes the new name) instead of adding a copy. Two entries of one extraction\n-- with the same identity are one product: the one with more hard-filter fields is kept, as\n-- validate_products.js does for exact repeats.\nWITH extracted AS (\n    SELECT p.*, product_identity(p.lender, p.product_name) AS identity_key, e.ord\n    FROM jsonb_array_elements($1::jsonb) WITH ORDINALITY AS e (item, ord)\n    CROSS JOIN LATERAL jsonb_to_record(e.item) AS p (\n        lender              text,\n        product_name        text,\n        source_url          text,\n        interest_rate_min   numeric,\n        interest_rate_max   numeric,\n        min_monthly_income  numeric,\n        min_credit_score    smallint,\n        min_age             smallint,\n        max_age             smallint,\n        allowed_employment  text[],\n        soft_criteria       jsonb,\n        field_confidence    jsonb,\n        criteria_json       jsonb,\n        criteria_hash       text\n    )\n),\nincoming AS (\n    SELECT DISTINCT ON (identity_key) e.*\n    FROM extracted e\n    ORDER BY identity_key,\n             num_nonnulls(min_age, max_age, min_credit_score, min_monthly_income,\n                          allowed_employment, interest_rate_min) DESC,\n             ord\n),\nprevious AS (\n    SELECT lp.identity_key, lp.criteria_json, lp.criteria_hash\n    FROM loan_products lp\n    JOIN incoming i ON lp.source_id = $2::integer AND lp.identity_key = i.identity_key\n),\nupserted AS (\n    INSERT INTO loan_products AS lp (\n        source_id, source_url, lender, product_name,\n        interest_rate_min, interest_rate_max, min_monthly_income, min_credit_score,\n        min_age, max_age, allowed_employment, soft_criteria, field_confidence,\n        criteria_json, criteria_hash, content_hash, is_active, last_seen_at\n    )\n    SELECT $2::integer, source_url, lender, product_name,\n           interest_rate_min, interest_rate_max, min_monthly_income, min_credit_score,\n           min_age, max_age, allowed_employment, soft_criteria, field_confidence,\n           criteria_json, criteria_hash, $4, true, now()\n    FROM incoming\n    ON CONFLICT (source_id, identity_key) DO UPDATE SET\n        source_url         = EXCLUDED.source_url,\n        lender             = EXCLUDED.lender,\n        product_name       = EXCLUDED.product_name,\n        interest_rate_min  = EXCLUDED.interest_rate_min,\n        interest_rate_max  = EXCLUDED.interest_rate_max,\n        min_monthly_income = EXCLUDED.min_monthly_income,\n        min_credit_score   = EXCLUDED.min_credit_score,\n        min_age            = EXCLUDED.min_age,\n        max_age            = EXCLUDED.max_age,\n        allowed_employment = EXCLUDED.allowed_employment,\n        soft_criteria      = EXCLUDED.soft_criteria,\n        field_confidence   = EXCLUDED.field_confidence,\n        criteria_json      = EXCLUDED.criteria_json,\n        needs_review       = lp.needs_review OR lp.criteria_hash <> EXCLUDED.criteria_hash,\n        criteria_hash      = EXCLUDED.criteria_hash,\n        content_hash       = EXCLUDED.content_hash,\n        is_active          = true,\n        last_seen_at       = now()\n    RETURNING lp.product_id, lp.identity_key, lp.criteria_json,\n              lp.criteria_hash, (lp.xmax = 0) AS inserted\n),\n-- Products of this source that the new extraction did not return are retired at once. Their\n-- criteria predate the page as it reads now, and keeping them active kept stale, often looser,\n-- rules matching customers until the stale-days sweep (docs/DECISIONS.md AD37). An empty\n-- extraction retires nothing, so a failed read can't empty a source.\nretired AS (\n    UPDATE loan_products lp\n    SET is_active = false\n    WHERE lp.source_id = $2::integer\n      AND lp.is_active\n      AND EXISTS (SELECT 1 FROM incoming)\n      AND NOT EXISTS (SELECT 1 FROM incoming i WHERE i.identity_key = lp.identity_key)\n    RETURNING lp.product_id\n),\nhistory AS (\n    INSERT INTO product_criteria_history (product_id, crawl_run_id, old_criteria, new_criteria, changed_fields)\n    SELECT u.product_id,\n           $3::bigint,\n           p.criteria_json,\n           u.criteria_json,\n           ARRAY(\n               SELECT k\n               FROM (\n                   SELECT jsonb_object_keys(u.criteria_json) AS k\n                   UNION\n                   SELECT jsonb_object_keys(COALESCE(p.criteria_json, '{}'::jsonb))\n               ) AS keys\n               WHERE (u.criteria_json -> k) IS DISTINCT FROM (p.criteria_json -> k)\n               ORDER BY k\n           )\n    FROM upserted u\n    LEFT JOIN previous p USING (identity_key)\n    WHERE p.criteria_hash IS DISTINCT FROM u.criteria_hash\n    RETURNING product_id, old_criteria IS NULL AS first_sighting\n)\nSELECT (SELECT count(*) FROM upserted)                                   AS products_upserted,\n       (SELECT count(*) FROM upserted WHERE inserted)                    AS products_new,\n       (SELECT count(*) FROM history WHERE NOT first_sighting)           AS products_changed,\n       (SELECT count(*) FROM retired)                                    AS products_retired;\n",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.products), $('Loop over sources').first().json.source_id, $('Start crawl run').first().json.run_id, $json.content_hash ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000025",
+      "name": "Mark changed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4256,
+        -96
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a8",
+              "name": "run_status",
+              "value": "changed",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a9",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000aa",
+              "name": "content_hash",
+              "value": "={{ $('Validate products').first().json.content_hash }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ab",
+              "name": "products_found",
+              "value": "={{ $('Validate products').first().json.products_found }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ac",
+              "name": "llm_calls",
+              "value": "={{ $('Validate products').first().json.llm_calls }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ad",
+              "name": "tokens_in",
+              "value": "={{ $('Validate products').first().json.tokens_in }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ae",
+              "name": "tokens_out",
+              "value": "={{ $('Validate products').first().json.tokens_out }}",
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000026",
+      "name": "Mark processing failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4256,
+        304
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000af",
+              "name": "run_status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b0",
+              "name": "error",
+              "value": "={{ 'validation or upsert failed: ' + ($json.message ?? $json.error?.message ?? $json.error ?? 'unknown') }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b1",
+              "name": "content_hash",
+              "value": "={{ $('Hash page text').item.json.content_hash }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b2",
+              "name": "llm_calls",
+              "value": "={{ $('Extract with LLM').item.json.calls ?? 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b3",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000027",
+      "name": "Finish crawl run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4480,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow A: close a crawl run and update the source's bookkeeping in one statement.\n--\n-- Parameters: #1 run_id, #2 status, #3 http_status, #4 content_hash, #5 products_found,\n--             #6 llm_calls, #7 tokens_in, #8 tokens_out, #9 error\n--\n-- On success ('changed' or 'unchanged') the source remembers the content hash, so the next run\n-- can skip the LLM when the page hasn't changed. On 'unchanged' the source's products are\n-- also marked as seen: they are still on the page, and without this they would be deactivated\n-- after PRODUCT_STALE_DAYS of an unchanged page. Always returns exactly one row, so the\n-- workflow's loop never stalls on an empty result.\nWITH run AS (\n    UPDATE crawl_runs\n    SET status         = $2,\n        http_status    = $3::integer,\n        content_hash   = $4,\n        products_found = $5::integer,\n        llm_calls      = COALESCE($6::integer, 0),\n        tokens_in      = COALESCE($7::integer, 0),\n        tokens_out     = COALESCE($8::integer, 0),\n        error          = $9,\n        finished_at    = now()\n    WHERE run_id = $1::bigint\n    RETURNING run_id, source_id, status, content_hash\n),\nsource AS (\n    UPDATE crawl_sources s\n    SET last_content_hash = run.content_hash,\n        last_crawled_at   = now()\n    FROM run\n    WHERE s.source_id = run.source_id\n      AND run.status IN ('changed', 'unchanged')\n    RETURNING s.source_id\n),\nseen AS (\n    UPDATE loan_products p\n    SET last_seen_at = now()\n    FROM run\n    WHERE p.source_id = run.source_id\n      AND p.is_active\n      AND run.status = 'unchanged'\n    RETURNING p.product_id\n)\nSELECT run.run_id,\n       run.status,\n       (SELECT count(*) FROM seen) AS products_touched\nFROM run;\n",
+        "options": {
+          "queryReplacement": "={{ [ $('Start crawl run').first().json.run_id, $json.run_status, $json.http_status ?? null, $json.content_hash ?? null, $json.products_found ?? null, $json.llm_calls ?? 0, $json.tokens_in ?? 0, $json.tokens_out ?? 0, $json.error ?? null ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000028",
+      "name": "Live mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4704,
+        304
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c5",
+              "leftValue": "={{ $('Load app_config').first().json.config.crawl_mode === 'live' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000029",
+      "name": "Polite pause",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        4928,
+        208
+      ],
+      "webhookId": "0a0a0a0a-0000-4000-8000-0000000000d1",
+      "parameters": {
+        "amount": "={{ Number($('Load app_config').first().json.config.crawl_delay_seconds) }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000030",
+      "name": "Mark early step failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2464,
+        496
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b4",
+              "name": "run_status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b5",
+              "name": "error",
+              "value": "={{ 'step failed before extraction: ' + ($json.message ?? $json.error?.message ?? $json.error ?? 'unknown') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Crawl summary": {
+      "main": [
+        [
+          {
+            "node": "Warm match cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily at 06:00": {
+      "main": [
+        [
+          {
+            "node": "Load app_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Load app_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load app_config": {
+      "main": [
+        [
+          {
+            "node": "Load sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load sources": {
+      "main": [
+        [
+          {
+            "node": "Loop over sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over sources": {
+      "main": [
+        [
+          {
+            "node": "Deactivate stale products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Start crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deactivate stale products": {
+      "main": [
+        [
+          {
+            "node": "Crawl summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start crawl run": {
+      "main": [
+        [
+          {
+            "node": "Fetch robots.txt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch robots.txt": {
+      "main": [
+        [
+          {
+            "node": "Plan page fetches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan page fetches": {
+      "main": [
+        [
+          {
+            "node": "Allowed by robots?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed by robots?": {
+      "main": [
+        [
+          {
+            "node": "Fetch pages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch pages": {
+      "main": [
+        [
+          {
+            "node": "Collect pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect pages": {
+      "main": [
+        [
+          {
+            "node": "Pages fetched?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pages fetched?": {
+      "main": [
+        [
+          {
+            "node": "Clean page text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean page text": {
+      "main": [
+        [
+          {
+            "node": "Hash page text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash page text": {
+      "main": [
+        [
+          {
+            "node": "Page changed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page changed?": {
+      "main": [
+        [
+          {
+            "node": "Build extraction request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark unchanged",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark unchanged": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build extraction request": {
+      "main": [
+        [
+          {
+            "node": "Extract with LLM",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract with LLM": {
+      "main": [
+        [
+          {
+            "node": "Extraction ok?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark extraction failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraction ok?": {
+      "main": [
+        [
+          {
+            "node": "Validate products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark extraction failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark extraction failed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate products": {
+      "main": [
+        [
+          {
+            "node": "Upsert products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark processing failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert products": {
+      "main": [
+        [
+          {
+            "node": "Mark changed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark processing failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark changed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finish crawl run": {
+      "main": [
+        [
+          {
+            "node": "Live mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live mode?": {
+      "main": [
+        [
+          {
+            "node": "Polite pause",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop over sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Polite pause": {
+      "main": [
+        [
+          {
+            "node": "Loop over sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark processing failed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark early step failed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  },
+  "active": false,
+  "pinData": {}
+}

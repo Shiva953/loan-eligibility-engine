@@ -1,0 +1,47 @@
+{
+  "_comment": "Single source of truth for Workflow A's sources. scripts/seed_sources.py upserts these into crawl_sources; scripts/fetch_fixtures.py saves their pages under tests/fixtures/crawl/<slug>/. Evidence for each choice: docs/DECISIONS.md, Crawl sources.",
+  "sources": [
+    {
+      "slug": "bankbazaar",
+      "display_name": "BankBazaar",
+      "kind": "aggregator",
+      "enabled": true,
+      "pages": [
+        {"url": "https://www.bankbazaar.com/personal-loan.html", "fixture": "personal-loan.html"},
+        {"url": "https://www.bankbazaar.com/personal-loan-eligibility.html", "fixture": "personal-loan-eligibility.html"}
+      ],
+      "content_selector": null
+    },
+    {
+      "slug": "hdfc-bank",
+      "display_name": "HDFC Bank",
+      "kind": "lender",
+      "enabled": true,
+      "pages": [
+        {"url": "https://www.hdfc.bank.in/personal-loan/eligibility-criteria", "fixture": "eligibility-criteria.html"}
+      ],
+      "content_selector": null
+    },
+    {
+      "slug": "kotak",
+      "display_name": "Kotak Mahindra Bank",
+      "kind": "lender",
+      "enabled": true,
+      "pages": [
+        {"url": "https://www.kotak.bank.in/en/personal-banking/loans/personal-loan/eligibility.html", "fixture": "eligibility.html"},
+        {"url": "https://www.kotak.bank.in/en/personal-banking/loans/personal-loan/interest-rate.html", "fixture": "interest-rate.html"}
+      ],
+      "content_selector": null
+    },
+    {
+      "slug": "hero-fincorp",
+      "display_name": "Hero FinCorp",
+      "kind": "lender",
+      "enabled": false,
+      "pages": [
+        {"url": "https://www.herofincorp.com/personal-loan-eligibility", "fixture": "personal-loan-eligibility.html"}
+      ],
+      "content_selector": null
+    }
+  ]
+}

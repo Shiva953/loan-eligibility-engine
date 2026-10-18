@@ -1,0 +1,162 @@
+# Local stack: n8n 2.x with external task runners, n8n's own metadata database, the
+# application database, and a webhook-only gateway. The optional cloudflared quick tunnel
+# exposes only that gateway, never the n8n UI (docs/DECISIONS.md AD3).
+#
+# Every host port binds to 127.0.0.1. Ports and the project name come from .env, so each git
+# worktree can run its own copy (AD7). Run `make env` first: secrets are required below.
+name: ${COMPOSE_PROJECT_NAME:-loanengine}
+
+x-pg-healthcheck: &pg-healthcheck
+  interval: 5s
+  timeout: 5s
+  retries: 30
+
+services:
+  n8n-db:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_DB: n8n
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${N8N_DB_PASSWORD:?run make env}
+    volumes:
+      - n8n_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      <<: *pg-healthcheck
+    restart: unless-stopped
+
+  app-db:
+    # Mirrors the RDS schema for development; 17 is supported on RDS.
+    image: postgres:17.11-alpine
+    # Write-path settings (DECISIONS AD28): a buffer cache that holds the matches primary key,
+    # compressed full-page images in the WAL, and checkpoints far enough apart that one large
+    # batch doesn't trigger several. Durability is unchanged (fsync and synchronous_commit on).
+    command:
+      - postgres
+      - -c
+      - shared_buffers=1GB
+      - -c
+      - wal_compression=lz4
+      - -c
+      - max_wal_size=8GB
+      - -c
+      - checkpoint_timeout=15min
+    environment:
+      POSTGRES_DB: ${APP_DB_NAME:-loans}
+      POSTGRES_USER: ${APP_DB_ADMIN_USER:-loans_admin}
+      POSTGRES_PASSWORD: ${APP_DB_ADMIN_PASSWORD:?run make env}
+    ports:
+      - "127.0.0.1:${APP_DB_HOST_PORT:-5433}:5432"
+    volumes:
+      - app_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      <<: *pg-healthcheck
+    restart: unless-stopped
+
+  n8n:
+    image: n8nio/n8n:2.43.6
+    depends_on:
+      n8n-db:
+        condition: service_healthy
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: n8n-db
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${N8N_DB_PASSWORD:?run make env}
+      # Encrypts stored credentials. Never change it once n8n has started (make env never does).
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?run make env}
+      # Code nodes run in the separate n8n-runners container (2.x external mode).
+      N8N_RUNNERS_MODE: external
+      N8N_RUNNERS_BROKER_LISTEN_ADDRESS: 0.0.0.0
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?run make env}
+      # The 2.x default, stated explicitly: workflows read switches from app_config (AD4).
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "true"
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Asia/Kolkata}
+      TZ: ${GENERIC_TIMEZONE:-Asia/Kolkata}
+      N8N_HOST: localhost
+      N8N_PORT: "5678"
+      N8N_PROTOCOL: http
+      # The UI is reachable only on 127.0.0.1, and Safari rejects secure cookies on plain-http
+      # localhost, so the secure-cookie flag would only break local logins.
+      N8N_SECURE_COOKIE: "false"
+      # Webhook requests arrive through webhook-gw, so trust exactly one proxy hop.
+      N8N_PROXY_HOPS: "1"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "168"
+      # Verified TLS to RDS (AD10): Node adds the RDS CA bundle to its trust store at start, so
+      # the Postgres credential keeps certificate checks on. `make rds-ca` downloads the bundle.
+      NODE_EXTRA_CA_CERTS: /certs/rds-global-bundle.pem
+    ports:
+      - "127.0.0.1:${N8N_HOST_PORT:-5678}:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Built workflow JSON, read by `n8n import:workflow` during bootstrap.
+      - ./n8n/workflows:/repo/workflows:ro
+      - ./certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5678/healthz >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    restart: unless-stopped
+
+  n8n-runners:
+    image: n8nio/runners:2.43.6
+    # JavaScript only: no workflow uses Python Code nodes, so that runner isn't started.
+    command: ["javascript"]
+    depends_on:
+      n8n:
+        condition: service_healthy
+    environment:
+      N8N_RUNNERS_TASK_BROKER_URI: http://n8n:5679
+      N8N_RUNNERS_AUTH_TOKEN: ${N8N_RUNNERS_AUTH_TOKEN:?run make env}
+      # 0 keeps the runner process alive between tasks. Started on demand, the first Code node
+      # after 15 idle seconds waited 2.2 s for a cold start: the largest delay in Workflow B
+      # after the LLM call and the write (docs/EXPERIMENTS.md).
+      N8N_RUNNERS_AUTO_SHUTDOWN_TIMEOUT: "0"
+      GENERIC_TIMEZONE: ${GENERIC_TIMEZONE:-Asia/Kolkata}
+    volumes:
+      # Pins what Code nodes may import, instead of inheriting the image default (V3).
+      - ./docker/runners/n8n-task-runners.json:/etc/n8n-task-runners.json:ro
+    restart: unless-stopped
+
+  webhook-gw:
+    image: nginx:1.29.8-alpine
+    depends_on:
+      - n8n
+    ports:
+      # Local only: lets `make webhook-test` exercise the same path the tunnel uses.
+      - "127.0.0.1:${WEBHOOK_GW_HOST_PORT:-8088}:80"
+    volumes:
+      - ./docker/webhook-gw/default.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  fixtures:
+    # Serves the saved crawl pages (tests/fixtures/crawl) to Workflow A when crawl_mode=fixtures,
+    # so fixture runs go through the same HTTP Request nodes as live runs. Internal network
+    # only: no host port.
+    image: nginx:1.29.8-alpine
+    volumes:
+      - ./tests/fixtures/crawl:/usr/share/nginx/html:ro
+    restart: unless-stopped
+
+  cloudflared:
+    # Opt-in (`make tunnel`): plain `docker compose up` exposes nothing to the internet.
+    image: cloudflare/cloudflared:2026.10.1
+    profiles: ["tunnel"]
+    command: ["tunnel", "--no-autoupdate", "--metrics", "0.0.0.0:20241", "--url", "http://webhook-gw:80"]
+    depends_on:
+      - webhook-gw
+    ports:
+      - "127.0.0.1:${CLOUDFLARED_METRICS_HOST_PORT:-20241}:20241"
+    restart: unless-stopped
+
+volumes:
+  n8n_data:
+  n8n_db_data:
+  app_db_data:

@@ -1,0 +1,233 @@
+{
+  "_comment": "Bench product set (docs/PLAN.md phase 4): 25 fictional lenders' products in the shape validate_products.js produces. Unlike the crawled pages (which yielded no fuzzy criteria), this set exercises every class: 15 fuzzy criterion instances over 12 distinct texts (some shared across products, to measure cross-product cache reuse), compilable filter and ranking rules, unknown_field caveats, one low-confidence (S6) field, and one product with no hard rules at all. Lender names are invented.",
+  "products": [
+    {
+      "lender": "Aurum Bank", "product_name": "Aurum Salaried Personal Loan",
+      "interest_rate_min": 10.5, "interest_rate_max": 16.0,
+      "min_monthly_income": 25000, "min_credit_score": 700, "min_age": 21, "max_age": 60,
+      "allowed_employment": ["Salaried"],
+      "soft_criteria": [
+        {"text": "Credit score 750+ preferred", "class": "compilable", "depends_on": ["credit_score"], "origin": "preferred_score", "rule": {"field": "credit_score", "op": ">=", "value": 750, "effect": "rank"}},
+        {"text": "Employees of listed companies get faster approval", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Aurum Bank", "product_name": "Aurum Professional Loan",
+      "interest_rate_min": 11.0, "interest_rate_max": 18.0,
+      "min_monthly_income": 50000, "min_credit_score": 700, "min_age": 25, "max_age": 65,
+      "allowed_employment": ["Self-Employed"],
+      "soft_criteria": [
+        {"text": "Self-employed professionals such as doctors, chartered accountants and architects", "class": "fuzzy", "depends_on": ["employment_status"], "origin": "page"},
+        {"text": "Practice vintage of at least 3 years", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Banyan Finance", "product_name": "Banyan Flexi Loan",
+      "interest_rate_min": 13.0, "interest_rate_max": 24.0,
+      "min_monthly_income": 20000, "min_credit_score": null, "min_age": 21, "max_age": 58,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Salaried applicants with a stable, regular monthly income", "class": "fuzzy", "depends_on": ["employment_status", "monthly_income"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Banyan Finance", "product_name": "Banyan Business Loan Lite",
+      "interest_rate_min": 15.0, "interest_rate_max": 26.0,
+      "min_monthly_income": 40000, "min_credit_score": 680, "min_age": 25, "max_age": 60,
+      "allowed_employment": ["Self-Employed", "Business"],
+      "soft_criteria": [
+        {"text": "Business owners and self-employed non-professionals", "class": "fuzzy", "depends_on": ["employment_status"], "origin": "page"},
+        {"text": "GST registration for at least 2 years", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Cedar Bank", "product_name": "Cedar Young Achiever Loan",
+      "interest_rate_min": 10.99, "interest_rate_max": 14.0,
+      "min_monthly_income": 30000, "min_credit_score": 720, "min_age": 21, "max_age": 35,
+      "allowed_employment": ["Salaried"],
+      "soft_criteria": [
+        {"text": "Young professionals at the start of their career", "class": "fuzzy", "depends_on": ["age", "employment_status"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Cedar Bank", "product_name": "Cedar Premier Loan",
+      "interest_rate_min": 9.99, "interest_rate_max": 12.5,
+      "min_monthly_income": 100000, "min_credit_score": 750, "min_age": 25, "max_age": 60,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "High-income individuals", "class": "fuzzy", "depends_on": ["monthly_income"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Delta Credit", "product_name": "Delta Instant Loan",
+      "interest_rate_min": 18.0, "interest_rate_max": 36.0,
+      "min_monthly_income": 15000, "min_credit_score": null, "min_age": 21, "max_age": 55,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Available in metro cities only", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Delta Credit", "product_name": "Delta Prime Loan",
+      "interest_rate_min": 12.0, "interest_rate_max": 20.0,
+      "min_monthly_income": 35000, "min_credit_score": 700, "min_age": 23, "max_age": 58,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Applicants with a good credit history", "class": "fuzzy", "depends_on": ["credit_score"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Evergreen NBFC", "product_name": "Evergreen Senior Loan",
+      "interest_rate_min": 14.0, "interest_rate_max": 22.0,
+      "min_monthly_income": 25000, "min_credit_score": 680, "min_age": 40, "max_age": 65,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Applicants who are not close to retirement age", "class": "fuzzy", "depends_on": ["age"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Evergreen NBFC", "product_name": "Evergreen Salary Advance",
+      "interest_rate_min": 16.0, "interest_rate_max": 28.0,
+      "min_monthly_income": 18000, "min_credit_score": null, "min_age": 21, "max_age": 58,
+      "allowed_employment": ["Salaried"],
+      "soft_criteria": [
+        {"text": "Credit score 700+ preferred", "class": "compilable", "depends_on": ["credit_score"], "origin": "preferred_score", "rule": {"field": "credit_score", "op": ">=", "value": 700, "effect": "rank"}},
+        {"text": "Salary credited to a bank account for at least 6 months", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Fortune Small Finance", "product_name": "Fortune Everyday Loan",
+      "interest_rate_min": 17.0, "interest_rate_max": 26.0,
+      "min_monthly_income": 15000, "min_credit_score": 650, "min_age": 21, "max_age": 60,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Minimum income ₹30,000/month for Business", "class": "compilable", "depends_on": ["monthly_income", "employment_status"], "origin": "income_tier", "rule": {"field": "monthly_income", "op": ">=", "value": 30000, "when": {"employment_status": ["Business"]}}}
+      ]
+    },
+    {
+      "lender": "Fortune Small Finance", "product_name": "Fortune Elite Loan",
+      "interest_rate_min": 11.5, "interest_rate_max": 15.0,
+      "min_monthly_income": 60000, "min_credit_score": 750, "min_age": 25, "max_age": 60,
+      "allowed_employment": ["Salaried", "Self-Employed"],
+      "soft_criteria": [
+        {"text": "Borrowers with an excellent repayment track record", "class": "fuzzy", "depends_on": ["credit_score"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Granite Bank", "product_name": "Granite Personal Loan",
+      "interest_rate_min": 10.75, "interest_rate_max": 19.0,
+      "min_monthly_income": 25000, "min_credit_score": 725, "min_age": 21, "max_age": 60,
+      "allowed_employment": ["Salaried"],
+      "soft_criteria": [
+        {"text": "Mid-career salaried professionals", "class": "fuzzy", "depends_on": ["age", "employment_status"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Granite Bank", "product_name": "Granite Doctor Loan",
+      "interest_rate_min": 10.5, "interest_rate_max": 15.0,
+      "min_monthly_income": 75000, "min_credit_score": 700, "min_age": 25, "max_age": 62,
+      "allowed_employment": ["Self-Employed"],
+      "soft_criteria": [
+        {"text": "Self-employed professionals such as doctors, chartered accountants and architects", "class": "fuzzy", "depends_on": ["employment_status"], "origin": "page"},
+        {"text": "Registered medical practitioners only", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Harbor Fintech", "product_name": "Harbor QuickCash",
+      "interest_rate_min": 20.0, "interest_rate_max": 36.0,
+      "min_monthly_income": 12000, "min_credit_score": null, "min_age": 21, "max_age": 50,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Requires an Aadhaar-linked mobile number", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Harbor Fintech", "product_name": "Harbor Flex Plus",
+      "interest_rate_min": 15.0, "interest_rate_max": 30.0,
+      "min_monthly_income": 30000, "min_credit_score": 690, "min_age": 23, "max_age": 55,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Applicants whose income comfortably exceeds the minimum requirement", "class": "fuzzy", "depends_on": ["monthly_income"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Indus Valley Bank", "product_name": "Indus Valley Personal Loan",
+      "interest_rate_min": 10.4, "interest_rate_max": 17.0,
+      "min_monthly_income": 30000, "min_credit_score": 700, "min_age": 21, "max_age": 60,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Minimum income ₹50,000/month for Self-Employed", "class": "compilable", "depends_on": ["monthly_income", "employment_status"], "origin": "income_tier", "rule": {"field": "monthly_income", "op": ">=", "value": 50000, "when": {"employment_status": ["Self-Employed"]}}}
+      ]
+    },
+    {
+      "lender": "Indus Valley Bank", "product_name": "Indus Valley Senior Salaried Loan",
+      "interest_rate_min": 10.25, "interest_rate_max": 14.0,
+      "min_monthly_income": 60000, "min_credit_score": 740, "min_age": 35, "max_age": 60,
+      "allowed_employment": ["Salaried"],
+      "soft_criteria": [
+        {"text": "Senior salaried employees with a strong credit profile", "class": "fuzzy", "depends_on": ["age", "credit_score", "employment_status"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Juniper Capital", "product_name": "Juniper Starter Loan",
+      "interest_rate_min": 19.0, "interest_rate_max": 30.0,
+      "min_monthly_income": 20000, "min_credit_score": 650, "min_age": 21, "max_age": 40,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Young professionals at the start of their career", "class": "fuzzy", "depends_on": ["age", "employment_status"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Juniper Capital", "product_name": "Juniper Gold Tier Loan",
+      "interest_rate_min": 12.0, "interest_rate_max": 18.0,
+      "min_monthly_income": 80000, "min_credit_score": 760, "min_age": 28, "max_age": 58,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "High-income individuals", "class": "fuzzy", "depends_on": ["monthly_income"], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Kestrel Bank", "product_name": "Kestrel Salaried Loan",
+      "interest_rate_min": 10.9, "interest_rate_max": 18.5,
+      "min_monthly_income": 25000, "min_credit_score": null, "min_age": 22, "max_age": 58,
+      "allowed_employment": ["Salaried"],
+      "soft_criteria": [
+        {"text": "Minimum credit score stated as 720 (extraction confidence 0.5)", "class": "fuzzy", "depends_on": ["credit_score"], "origin": "low_confidence"}
+      ]
+    },
+    {
+      "lender": "Kestrel Bank", "product_name": "Kestrel Flexi Loan",
+      "interest_rate_min": 12.0, "interest_rate_max": 21.0,
+      "min_monthly_income": null, "min_credit_score": 700, "min_age": 21, "max_age": 65,
+      "allowed_employment": null,
+      "soft_criteria": [
+        {"text": "Existing Kestrel Bank customers only", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Lotus Finance", "product_name": "Lotus Business Express",
+      "interest_rate_min": 16.0, "interest_rate_max": 24.0,
+      "min_monthly_income": 50000, "min_credit_score": 700, "min_age": 26, "max_age": 65,
+      "allowed_employment": ["Business"],
+      "soft_criteria": [
+        {"text": "Business vintage of at least 3 years", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Lotus Finance", "product_name": "Lotus Women Entrepreneurs Loan",
+      "interest_rate_min": 14.0, "interest_rate_max": 20.0,
+      "min_monthly_income": 25000, "min_credit_score": 680, "min_age": 21, "max_age": 60,
+      "allowed_employment": ["Self-Employed", "Business"],
+      "soft_criteria": [
+        {"text": "Women applicants only", "class": "unknown_field", "depends_on": [], "origin": "page"}
+      ]
+    },
+    {
+      "lender": "Meridian Bank", "product_name": "Meridian Everyday Loan",
+      "interest_rate_min": 11.0, "interest_rate_max": 20.0,
+      "min_monthly_income": null, "min_credit_score": null, "min_age": null, "max_age": null,
+      "allowed_employment": null,
+      "soft_criteria": []
+    }
+  ]
+}

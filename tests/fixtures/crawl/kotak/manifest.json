@@ -1,0 +1,28 @@
+{
+  "entries": [
+    {
+      "file": "robots.txt",
+      "url": "https://www.kotak.bank.in/robots.txt",
+      "status": 200,
+      "bytes": 2318,
+      "sha256": "8379c5829b6e5250356a6b962666e81791e05b59b1e57e88b56e10195f55fc97",
+      "fetched_at": "2026-10-16T10:10:56+00:00"
+    },
+    {
+      "file": "eligibility.html",
+      "url": "https://www.kotak.bank.in/en/personal-banking/loans/personal-loan/eligibility.html",
+      "status": 200,
+      "bytes": 813126,
+      "sha256": "46b95cd63f124b2bb41d9b88867c55d48a207300929f7f1e201e03d7998bfe6c",
+      "fetched_at": "2026-10-16T10:11:01+00:00"
+    },
+    {
+      "file": "interest-rate.html",
+      "url": "https://www.kotak.bank.in/en/personal-banking/loans/personal-loan/interest-rate.html",
+      "status": 200,
+      "bytes": 787176,
+      "sha256": "a92b987a7a60d8ee15f4bb4f6b16cfb3a869655f083d788f5bd194d89bad3404",
+      "fetched_at": "2026-10-16T10:11:06+00:00"
+    }
+  ]
+}

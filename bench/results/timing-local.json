@@ -1,0 +1,153 @@
+{
+  "target": "local",
+  "region": "ap-southeast-2",
+  "measured_at": "2026-10-17T21:01:00+0530",
+  "network": {
+    "region_tcp": {
+      "what": "TCP handshake sts.ap-southeast-2.amazonaws.com",
+      "median_ms": 392.23,
+      "p90_ms": 465.27,
+      "n": 20,
+      "note": "3.27.177.33"
+    },
+    "compare_region_tcp": {
+      "what": "TCP handshake sts.ap-south-1.amazonaws.com",
+      "median_ms": 34.61,
+      "p90_ms": 88.06,
+      "n": 20,
+      "note": "13.200.92.183"
+    },
+    "db_select1": {
+      "what": "SELECT 1 on an open connection",
+      "median_ms": 0.59,
+      "p90_ms": 0.91,
+      "n": 20,
+      "note": ""
+    },
+    "db_fresh_connection": {
+      "what": "fresh connection + SELECT 1",
+      "median_ms": 9.4,
+      "p90_ms": 15.99,
+      "n": 5,
+      "note": "no TLS"
+    },
+    "webhook_direct": {
+      "what": "POST 127.0.0.1:8088",
+      "median_ms": 20.24,
+      "p90_ms": 32.61,
+      "n": 10,
+      "note": "HTTP 401, rejected unsigned"
+    },
+    "webhook_tunnel": {
+      "what": "tunnel",
+      "median_ms": null,
+      "p90_ms": null,
+      "n": 0,
+      "note": "not running (`make tunnel` to include it)"
+    }
+  },
+  "database": {
+    "users": 298370,
+    "matches": 6398754,
+    "matches_size": "247 MB",
+    "shared_buffers": "1GB"
+  },
+  "workflow_b": {
+    "executions": [
+      {
+        "id": "509",
+        "workflow": "B \u00b7 User-loan matching",
+        "mode": "webhook",
+        "duration_ms": 1222,
+        "round_trips": {
+          "Claim batch": 1,
+          "Write matches": 1
+        },
+        "postgres_ms": 891,
+        "llm_calls": 0,
+        "ses_sends": 0,
+        "children": [
+          "510"
+        ]
+      },
+      {
+        "id": "510",
+        "workflow": "C \u00b7 User notification",
+        "mode": "integrated",
+        "duration_ms": 262,
+        "round_trips": {
+          "Plan notifications": 1
+        },
+        "postgres_ms": 239,
+        "llm_calls": 0,
+        "ses_sends": 0,
+        "children": []
+      }
+    ],
+    "round_trips": 3,
+    "postgres_node_ms": 1130,
+    "llm_calls": 0,
+    "ses_sends": 0,
+    "duration_ms": 1222
+  },
+  "workflow_a": {
+    "executions": [
+      {
+        "id": "478",
+        "workflow": "A \u00b7 Loan product discovery",
+        "mode": "manual",
+        "duration_ms": 1031,
+        "round_trips": {
+          "Load app_config": 1,
+          "Load sources": 1,
+          "Start crawl run": 3,
+          "Finish crawl run": 3,
+          "Deactivate stale products": 1,
+          "Crawl summary": 1
+        },
+        "postgres_ms": 84,
+        "llm_calls": 0,
+        "ses_sends": 0,
+        "children": [
+          "479"
+        ]
+      },
+      {
+        "id": "479",
+        "workflow": "Warm match cache (sub-workflow)",
+        "mode": "integrated",
+        "duration_ms": 65,
+        "round_trips": {
+          "Find unjudged cohorts": 1
+        },
+        "postgres_ms": 48,
+        "llm_calls": 0,
+        "ses_sends": 0,
+        "children": []
+      }
+    ],
+    "round_trips": 11,
+    "postgres_node_ms": 132,
+    "llm_calls": 0,
+    "ses_sends": 0,
+    "duration_ms": 1031
+  },
+  "split": {
+    "ingest_ms": 167,
+    "sql_server_ms": 923,
+    "sql_statements_timed": 3,
+    "postgres_node_ms": 1130,
+    "n8n_other_ms": 92,
+    "workflow_b_ms": 1222,
+    "webhook_to_notified_ms": 1311,
+    "round_trips": 3,
+    "network_now_ms": 1.8,
+    "cross_region_per_trip_ms": 392.23,
+    "cross_region_round_trips_ms": 1177,
+    "cold_pool_connection_ms": 1961,
+    "tunnel_overhead_ms": null,
+    "tunnel_hop_ms": 392,
+    "ses_sends": 0,
+    "llm_calls": 0
+  }
+}

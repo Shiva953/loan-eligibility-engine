@@ -1,0 +1,107 @@
+# =========================================================================
+# robots.txt — www.herofincorp.com
+# Updated 2026-08-27 based on Search Console Page Indexing "Coverage"
+# drilldowns (404 / redirect / duplicate-canonical / crawled-not-indexed).
+# =========================================================================
+# NOTE ON HOW ROBOTS.TXT MATCHES: a crawler that has its OWN named group
+# below (GPTBot, ClaudeBot, PerplexityBot, etc.) reads ONLY that group and
+# completely ignores "User-agent: *" — so the crawl-budget hygiene rules
+# below only apply to unnamed/default crawlers. The named LLM bot groups
+# are intentionally left as plain "Allow: /" with no Disallow rules.
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# Default rules — applies to any crawler with no dedicated group below
+# -------------------------------------------------------------------------
+User-agent: *
+Allow: /
+
+Disallow: /search/
+Disallow: /blog/search/
+Disallow: */tags/*
+Disallow: *?page=*
+Disallow: *?utm_*
+Disallow: *?url=*
+Disallow: *?fbclid=*
+Disallow: *?gclid=*
+Disallow: *?gtm_latency=*
+Disallow: *?mdrv=*
+Disallow: *?gad_source=*
+Disallow: *?trk=*
+Disallow: *?vpe_id=*
+Disallow: *?wptouch_preview_theme=*
+Disallow: *?isComingFromApp=*
+Disallow: *field_job_*
+Disallow: */public/*
+Disallow: */sites/default/*
+Disallow: */index.php/*
+Disallow: /*?_rsc=
+
+Sitemap: https://www.herofincorp.com/sitemap.xml
+
+# =========================================================================
+# AI CRAWLERS — bulk/training & search-indexing bots
+# Left as Allow: / with no crawl-budget Disallow rules, per request.
+# =========================================================================
+
+# Training crawler — builds datasets for GPT model development
+User-agent: GPTBot
+Allow: /
+
+# Search indexing crawler — powers ChatGPT Search citations
+# WARNING: Blocking this removes your site from ChatGPT Search answers entirely
+User-agent: OAI-SearchBot
+Allow: /
+
+# User-triggered fetcher — activated when a human pastes a URL into ChatGPT
+# Note: OpenAI states this may not always respect robots.txt on user request
+# Left as Allow: / only — this is a one-off fetch of a specific URL a
+# person requested, not bulk crawling, so the hygiene rules aren't needed.
+User-agent: ChatGPT-User
+Allow: /
+
+# Training crawler — used for Claude model training data collection
+User-agent: ClaudeBot
+Allow: /
+
+# Search indexing crawler — powers Claude's web search and citation features
+# WARNING: Anthropic states blocking this "may reduce" visibility in Claude answers
+User-agent: Claude-SearchBot
+Allow: /
+
+# User-triggered fetcher — activated when a Claude user requests a specific page
+User-agent: Claude-User
+Allow: /
+
+# Primary indexing crawler — builds Perplexity's AI search index
+User-agent: PerplexityBot
+Allow: /
+
+# User-triggered retrieval — fetches pages when a Perplexity user clicks a citation
+User-agent: Perplexity-User
+Allow: /
+
+# Controls Gemini model training and Vertex AI data collection
+User-agent: Google-Extended
+Allow: /
+
+# NOTE: "Googlebot-Extended" is not a documented Google crawler token — the
+# real AI-grounding control token is "Google-Extended" (above). This group
+# is kept as-is from your original file in case it's used internally, but
+# it will most likely just be ignored by Google and fall back to the
+# "User-agent: *" rules. Verify with Google Search Central before relying on it.
+User-agent: Googlebot-Extended
+Allow: /
+
+User-agent: Meta-ExternalAgent
+Allow: /
+
+# ------------------------------------------------------------------------------
+# CCBot — Common Crawl (open dataset used by many AI labs)
+# Common Crawl data underlies training for GPT, LLaMA, Mistral, and many others.
+# Allowing CCBot is a broad opt-in for open AI research datasets.
+# ------------------------------------------------------------------------------
+User-agent: CCBot
+Allow: /
+
+Sitemap: https://www.herofincorp.com/sitemap.xml

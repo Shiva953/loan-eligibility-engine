@@ -1,0 +1,48 @@
+# Secrets: only .env.example is committed
+.env
+.env.*
+!.env.example
+*.pem
+certs/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build output (Lambda packages, layers)
+build/
+dist/
+*.zip
+
+# Serverless / Node
+.serverless/
+node_modules/
+
+# n8n: decrypted credential exports must never be committed
+n8n/.credentials/
+n8n/**/*credentials*.json
+
+# Generated data (regenerate with scripts/gen_users.py)
+data/generated/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# LLM responses cached by the bench (regenerable; results JSON is committed instead)
+bench/llm_cache/
+
+# Next.js upload page (ui/)
+ui/node_modules/
+ui/.next/
+ui/out/
+ui/next-env.d.ts
+ui/tsconfig.tsbuildinfo
+**/CLAUDE.md

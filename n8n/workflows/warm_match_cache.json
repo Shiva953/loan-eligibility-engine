@@ -1,0 +1,312 @@
+{
+  "id": "lnWfMatchWarm001",
+  "name": "Warm match cache (sub-workflow)",
+  "nodes": [
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000001",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -448
+      ],
+      "parameters": {
+        "width": 1184,
+        "height": 224,
+        "content": "## Warm match cache (called by A after every crawl)\nJudges, before any batch arrives, every cohort the active products can produce (`cohort_space()`, enumerated from the products alone) and compiles every fuzzy criterion that has no rule yet, through the same request builder and LLM gateway as Workflow B. A batch then finds everything cached, so **Workflow B makes no LLM call at match time**.\nUnder threshold banding the space is exactly what batches produce, so this costs no extra calls. With nothing new it is one query and no request. A failure here never fails the crawl: Workflow B still judges anything uncached itself."
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000002",
+      "name": "Called by A",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000003",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        192
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000005",
+      "name": "Find unjudged cohorts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "executeOnce": true,
+      "position": [
+        224,
+        96
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Warm match cache (called by Workflow A after every crawl): which cohorts and criteria the\n-- active products can produce have no cached verdict or compiled rule yet?\n--\n-- Same output shape as uncached_cohorts.sql, so the same Code nodes build the requests; the\n-- difference is the source: cohort_space() enumerates cohorts from the products instead of\n-- from a batch's users. After this ran, a batch finds everything cached and Workflow B makes\n-- no LLM call. Cheap when there is nothing to do: one query, no request. It reads app_config\n-- itself (returned as config for the Code nodes), so the warm step is one round trip.\n--\n-- Parameters: #1 banding mode, #2 match_llm_enabled, #3 match_rules_enabled\n--             ('' = from app_config, as in the workflow; the bench passes values), #4 execution id\n--\n-- JIT is off for this statement: the planner's estimate for the cohort space is huge (it can't\n-- see how few criteria are fuzzy), so JIT compiled a 2-5 ms query for 0.5 s locally and 5 s in\n-- a fresh n8n connection. n8n sends both statements as one message, so SET LOCAL ends with it.\nSET LOCAL jit = off;\n\nWITH config AS (\n    SELECT jsonb_object_agg(key, value) AS config FROM app_config\n),\nsettings AS (\n    SELECT c.config,\n           coalesce(nullif($1, ''), c.config ->> 'cohort_bands') AS cohort_bands,\n           coalesce(nullif($2, ''), c.config ->> 'match_llm_enabled')::boolean AS llm,\n           coalesce(nullif($3, ''), c.config ->> 'match_rules_enabled')::boolean AS rules\n    FROM config c\n),\n-- Products that share a criterion share its cohorts; one wording per key is enough. One branch\n-- per banding mode, so the mode is a literal and cohort_space() is planned for it (as a column\n-- it inflated the cost estimate to 10^9 and JIT compilation took 0.5-5 s for a 2 ms query);\n-- the one-time filter runs only the configured branch.\nspace AS MATERIALIZED (\n    SELECT DISTINCT ON (c.criterion_key, c.signature)\n           c.criterion_key, c.criterion_text, c.depends_on, c.signature\n    FROM (\n        SELECT * FROM cohort_space('threshold')\n        WHERE (SELECT cohort_bands NOT IN ('coarse', 'fine', 'exact') FROM settings)\n        UNION ALL\n        SELECT * FROM cohort_space('coarse') WHERE (SELECT cohort_bands = 'coarse' FROM settings)\n        UNION ALL\n        SELECT * FROM cohort_space('fine') WHERE (SELECT cohort_bands = 'fine' FROM settings)\n    ) c\n    WHERE (SELECT llm FROM settings)\n    ORDER BY c.criterion_key, c.signature, c.criterion_text\n),\nuncached AS MATERIALIZED (\n    SELECT s.*\n    FROM space s\n    WHERE NOT EXISTS (\n        SELECT 1 FROM llm_decisions d\n        WHERE d.criteria_hash = s.criterion_key AND d.user_signature = s.signature\n    )\n),\nuncompiled AS MATERIALIZED (\n    SELECT DISTINCT ON (s.criterion_key) s.criterion_key, s.criterion_text, s.depends_on\n    FROM space s\n    WHERE (SELECT rules FROM settings)\n      AND NOT EXISTS (SELECT 1 FROM criterion_rules r WHERE r.criterion_key = s.criterion_key)\n    ORDER BY s.criterion_key, s.criterion_text\n),\ntotals AS (\n    SELECT (SELECT count(*) FROM space)::bigint AS cohorts_total,\n           (SELECT count(*) FROM uncached)::bigint AS cohorts_uncached,\n           (SELECT count(DISTINCT criterion_key) FROM space)::bigint AS criteria_total,\n           (SELECT count(*) FROM uncompiled)::bigint AS criteria_uncompiled,\n           round(extract(epoch FROM clock_timestamp() - statement_timestamp()) * 1000)::integer AS ms\n),\nmetrics AS (\n    INSERT INTO pipeline_metrics (run_id, batch_id, workflow, stage, pairs_in, pairs_out, duration_ms, details)\n    SELECT $4, NULL, 'B', 'warm_cache', t.cohorts_total, t.cohorts_uncached, t.ms,\n           jsonb_build_object('banding', s.cohort_bands, 'criteria', t.criteria_total,\n                              'criteria_uncompiled', t.criteria_uncompiled)\n    FROM totals t, settings s\n    RETURNING 1\n)\nSELECT s.config,\n       -- The match model's latency from its own call log, for sizing requests (AD29): a line\n       -- fitted to duration over output tokens, last 200 answered calls.\n       (SELECT jsonb_build_object(\n                   'model', s.config ->> 'llm_model_match', 'calls', count(*),\n                   'l0_ms', round(regr_intercept(c.duration_ms, c.tokens_out)),\n                   'ms_per_token', round(regr_slope(c.duration_ms, c.tokens_out)::numeric, 3),\n                   'r2', round(regr_r2(c.duration_ms, c.tokens_out)::numeric, 3))\n        FROM (SELECT l.duration_ms, l.tokens_out FROM llm_calls l\n              WHERE l.model = s.config ->> 'llm_model_match' AND l.outcome = 'ok'\n                AND l.duration_ms IS NOT NULL\n              ORDER BY l.call_id DESC LIMIT 200) c) AS llm_latency,\n       t.cohorts_total,\n       t.cohorts_uncached,\n       t.criteria_total,\n       t.criteria_uncompiled,\n       t.ms AS duration_ms,\n       (SELECT count(*) FROM metrics) AS metrics_written,\n       coalesce((SELECT jsonb_agg(jsonb_build_object(\n                     'criterion_key', criterion_key, 'criterion_text', criterion_text,\n                     'depends_on', depends_on, 'signature', signature)\n                     ORDER BY criterion_key, signature)\n                 FROM uncached), '[]'::jsonb) AS cohorts,\n       coalesce((SELECT jsonb_agg(jsonb_build_object(\n                     'criterion_key', criterion_key, 'criterion_text', criterion_text,\n                     'depends_on', depends_on)\n                     ORDER BY criterion_key)\n                 FROM uncompiled), '[]'::jsonb) AS criteria\nFROM totals t, settings s;\n",
+        "options": {
+          "queryReplacement": "={{ [ '', '', '', $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000006",
+      "name": "LLM needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        448,
+        96
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0e0e0e0e-0000-4000-8000-000000000101",
+              "leftValue": "={{ $json.cohorts.length > 0 || $json.criteria.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000007",
+      "name": "Nothing to judge",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        672,
+        288
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000008",
+      "name": "Build cohort requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Build cohort requests\" (Workflow B). Mode: Run Once for All Items.\n//\n// Fuzzy criteria get two independent judges (docs/EXPERIMENTS.md, LLM stage):\n//   1. Cohort judge (S3-S5): the uncached cohorts are packed K to a request, so a request costs\n//      one gateway call whatever the number of users behind it. Cohorts are sorted by criterion,\n//      so each request states a criterion's wording once and lists its cohorts under it. Each\n//      cohort is described only by the banded facts its criterion depends on, so one verdict\n//      holds for every user in the cohort.\n//   2. Rule judge: every criterion not compiled yet goes into one compile request. The LLM\n//      writes clauses tagged eligible / ineligible over the exact facts, and leaves everything\n//      else uncertain; SQL applies them to every user (write_matches.sql).\n// The prompts here are the ones the bench validated against the oracle; bench/llm_experiments.py\n// builds its requests through this file, so the two can't drift.\n//\n// Input:  one item { config (app_config), llm_latency (the match model's fitted latency),\n//                    cohorts: [{ criterion_key, criterion_text, depends_on, signature, pairs }],\n//                    criteria: [{ criterion_key, criterion_text, depends_on }] }\n// Output: one item per request, provider-neutral for the LLM gateway, plus cohort_refs\n//         (question id -> criterion_key + signature) or criteria_refs (rule id -> criterion)\n//         for mapping the answers back.\n\nconst PROMPT_VERSION = 'judge-v1';\nconst COMPILE_PROMPT_VERSION = 'compile-v1';\nconst COMPILE_MAX_CRITERIA = 25;\n\nconst COMPILE_SYSTEM = `You turn a lender's qualitative eligibility criterion into explicit conditions on the applicant facts it depends on, so a database can apply it without asking again. Facts: age (years), credit_score (300-900 CIBIL), employment_status (exactly one of Salaried, Self-Employed, Business), monthly_income (INR per month).\nFor each criterion give a list of clauses, each with a verdict:\n- eligible: the applicant profiles it covers clearly satisfy the criterion;\n- ineligible: the applicant profiles it covers clearly do not satisfy it.\nEvery profile no clause covers is uncertain. A clause covers a profile when every condition in it holds; leave a bound null when it does not restrict, and leave employment_status empty when any employment qualifies. Write a clause only when the answer would be the same for every applicant it covers. Do not invent cut-offs the wording does not imply: when the criterion depends on something the facts do not show, leave those profiles uncertain.`;\n\nconst SYSTEM = `You decide whether loan applicants meet a lender's qualitative eligibility criterion. Each question gives one criterion and an applicant profile. When a fact is given as a range, the applicant's value lies somewhere in that range: answer for the whole range. Facts that are not mentioned are unknown; do not assume them.\nAnswer each question with exactly one verdict:\n- eligible: the profile clearly satisfies the criterion;\n- ineligible: the profile clearly does not satisfy it;\n- uncertain: the answer depends on something not given, or the range includes applicants who would get different answers.\nJudge only the stated criterion, not other lending rules. Give a reason of at most 15 words.`;\n\nconst LABELS = {\n  age: (lo, hi) => (lo && hi ? `age ${lo}–${hi} years` : lo ? `age ${lo} years or older` : `age up to ${hi} years`),\n  credit_score: (lo, hi) => (lo && hi ? `credit score ${lo}–${hi}` : lo ? `credit score ${lo} or higher` : `credit score up to ${hi}`),\n  monthly_income: (lo, hi) => {\n    const r = (v) => `₹${Number(v).toLocaleString('en-IN')}`;\n    return lo && hi ? `monthly income ${r(lo)}–${r(hi)}` : lo ? `monthly income ${r(lo)} or more` : `monthly income up to ${r(hi)}`;\n  },\n};\n\nconst EXACT = {\n  age: (v) => `age ${v} years`,\n  credit_score: (v) => `credit score ${v}`,\n  monthly_income: (v) => `monthly income ₹${Number(v).toLocaleString('en-IN')}`,\n};\n\n// \"age=21..24;employment_status=Salaried\" -> \"age 21–24 years; employment: Salaried\"\nfunction describe(signature) {\n  return signature\n    .split(';')\n    .filter(Boolean)\n    .map((part) => {\n      const [field, value] = part.split('=');\n      if (field === 'employment_status') return `employment: ${value}`;\n      if (!value.includes('..')) return EXACT[field](value);\n      const [lo, hi] = value.split('..');\n      if (!lo && !hi) return `${field.replace('_', ' ')}: any`;\n      return LABELS[field](lo, hi);\n    })\n    .join('; ');\n}\n\nfunction schemaFor(count) {\n  return {\n    type: 'object',\n    properties: {\n      verdicts: {\n        type: 'array',\n        minItems: count,\n        maxItems: count,\n        items: {\n          type: 'object',\n          properties: {\n            id: { type: 'integer' },\n            verdict: { type: 'string', enum: ['eligible', 'ineligible', 'uncertain'] },\n            reason: { type: 'string' },\n          },\n          required: ['id', 'verdict', 'reason'],\n          additionalProperties: false,\n        },\n      },\n    },\n    required: ['verdicts'],\n    additionalProperties: false,\n  };\n}\n\n// Key order matters: the bench's cache key is the serialised schema.\nfunction compileSchemaFor(count) {\n  const bound = { type: ['number', 'null'] };\n  const clause = {\n    type: 'object',\n    additionalProperties: false,\n    properties: {\n      verdict: { type: 'string', enum: ['eligible', 'ineligible'] },\n      employment_status: { type: 'array', items: { type: 'string', enum: ['Salaried', 'Self-Employed', 'Business'] } },\n      age_min: bound,\n      age_max: bound,\n      credit_score_min: bound,\n      credit_score_max: bound,\n      monthly_income_min: bound,\n      monthly_income_max: bound,\n    },\n    required: ['verdict', 'employment_status', 'age_min', 'age_max', 'credit_score_min',\n      'credit_score_max', 'monthly_income_min', 'monthly_income_max'],\n  };\n  return {\n    type: 'object',\n    required: ['rules'],\n    additionalProperties: false,\n    properties: {\n      rules: {\n        type: 'array',\n        minItems: count,\n        maxItems: count,\n        items: {\n          type: 'object',\n          required: ['id', 'clauses', 'note'],\n          additionalProperties: false,\n          properties: { id: { type: 'integer' }, clauses: { type: 'array', items: clause }, note: { type: 'string' } },\n        },\n      },\n    },\n  };\n}\n\nfunction compileRequests(criteria, config) {\n  const sorted = [...criteria].sort((a, b) => (a.criterion_key < b.criterion_key ? -1 : a.criterion_key > b.criterion_key ? 1 : 0));\n  const requests = [];\n  for (let start = 0; start < sorted.length; start += COMPILE_MAX_CRITERIA) {\n    const chunk = sorted.slice(start, start + COMPILE_MAX_CRITERIA);\n    const lines = ['Compile each criterion. Answer each id exactly once.', ''];\n    chunk.forEach((c, i) => lines.push(`${i + 1}. \"${c.criterion_text}\" (depends on: ${c.depends_on.join(', ')})`));\n    requests.push({\n      purpose: 'compile_criteria',\n      prompt_version: COMPILE_PROMPT_VERSION,\n      model: config.llm_model_match,\n      temperature: 0,\n      max_output_tokens: 2048 + 384 * chunk.length,\n      system: COMPILE_SYSTEM,\n      prompt: lines.join('\\n'),\n      schema: compileSchemaFor(chunk.length),\n      criteria_refs: chunk.map((c, i) => ({\n        id: i + 1, criterion_key: c.criterion_key, criterion_text: c.criterion_text, depends_on: c.depends_on,\n      })),\n    });\n  }\n  return requests;\n}\n\n// Stratified batching: round j holds the j-th cohort of every criterion, so no request asks\n// about two bands of the same criterion. Listing adjacent bands together invites the model to\n// draw a line between them instead of judging each band on its own (docs/EXPERIMENTS.md).\nfunction stratify(sorted) {\n  const byKey = new Map();\n  for (const c of sorted) {\n    if (!byKey.has(c.criterion_key)) byKey.set(c.criterion_key, []);\n    byKey.get(c.criterion_key).push(c);\n  }\n  const rounds = [];\n  for (const list of byKey.values()) {\n    list.forEach((c, j) => {\n      rounds[j] = rounds[j] ?? [];\n      rounds[j].push(c);\n    });\n  }\n  return rounds;\n}\n\n// ---- request size (K) per model -------------------------------------------------------------\n// K is a property of the model and the account, not a constant (DECISIONS AD29):\n//   * llm_batch_k caps it: the most cohorts per call validated for accuracy (25 for this prompt\n//     on gemini-3.5-flash-lite: no false drops; packing borderline bands broke judgement).\n//   * One request at a time (llm_concurrency 1), a batch costs (requests x fixed latency) +\n//     (output tokens x per-token latency), so the fewest requests win: K = the cap.\n//   * With parallel slots and a model whose latency grows with output, smaller requests run side\n//     by side and the last one finishes sooner. The planner then picks the K whose balanced\n//     requests, packed onto the slots, finish first, preferring fewer requests on a tie.\n// The latency comes from the model's own call log (llm_latency: duration fitted to output\n// tokens). A fit that explains little, like Gemini's free tier (R2 0.01: a flat 7-10 s per\n// request), counts as a flat cost, and K stays at the cap.\nconst JUDGE_TOKENS = (n) => 20 + 35 * n; // measured: 25 answers ~ 885 output tokens\nconst COMPILE_TOKENS = (n) => 125 * n; // measured: 12 criteria ~ 1,400-1,600 tokens\n\nfunction latencyModel(latency) {\n  const usable = latency && Number(latency.calls) >= 20 && Number(latency.r2) >= 0.3 && Number(latency.ms_per_token) > 0;\n  return usable ? { l0: Math.max(0, Number(latency.l0_ms) || 0), perToken: Number(latency.ms_per_token) } : null;\n}\n\nfunction sequentialSizes(n, k) {\n  const sizes = [];\n  for (let left = n; left > 0; left -= k) sizes.push(Math.min(k, left));\n  return sizes;\n}\n\nfunction balancedSizes(n, k) {\n  const parts = Math.ceil(n / k);\n  return Array.from({ length: parts }, (_, i) => Math.floor(n / parts) + (i < n % parts ? 1 : 0));\n}\n\n// When the last of these requests finishes on `slots` parallel slots (longest first, each onto\n// the least busy slot).\nfunction finishMs(durations, slots) {\n  const load = new Array(slots).fill(0);\n  for (const d of [...durations].sort((a, b) => b - a)) load[load.indexOf(Math.min(...load))] += d;\n  return Math.max(...load);\n}\n\nfunction planBatchSize(cohortCount, criteriaCount, config, latency) {\n  const cap = Math.max(1, Number(config.llm_batch_k) || 25);\n  const slots = Math.max(1, Math.floor(Number(config.llm_concurrency) || 1));\n  const model = latencyModel(latency);\n  if (slots === 1 || !model || cohortCount <= 1) return { k: cap, balanced: false };\n  const ms = (tokens) => model.l0 + model.perToken * tokens;\n  const compile = sequentialSizes(criteriaCount, COMPILE_MAX_CRITERIA).map((n) => ms(COMPILE_TOKENS(n)));\n  let best = null;\n  for (let k = Math.min(cap, cohortCount); k >= 1; k -= 1) {\n    const durations = [...balancedSizes(cohortCount, k).map((n) => ms(JUDGE_TOKENS(n))), ...compile];\n    const finish = finishMs(durations, slots);\n    if (!best || finish < best.finish - 1) best = { k, finish };\n  }\n  return { k: best.k, balanced: true };\n}\n\nfunction buildRequests(cohorts, config, plan = { k: Math.max(1, Number(config.llm_batch_k)), balanced: false }) {\n  const k = plan.k;\n  const sorted = [...cohorts].sort(\n    (a, b) => a.criterion_text.localeCompare(b.criterion_text) || a.signature.localeCompare(b.signature),\n  );\n  const groups = config.llm_batch_mode === 'stratified' ? stratify(sorted) : [sorted];\n  const chunks = [];\n  for (const group of groups) {\n    const sizes = plan.balanced ? balancedSizes(group.length, k) : sequentialSizes(group.length, k);\n    let start = 0;\n    for (const size of sizes) {\n      chunks.push(group.slice(start, start + size));\n      start += size;\n    }\n  }\n  const requests = [];\n  for (const chunk of chunks) {\n    const lines = ['Judge every question. Answer each question id exactly once.', ''];\n    const refs = [];\n    let current = null;\n    let letter = 0;\n    chunk.forEach((cohort, i) => {\n      if (cohort.criterion_key !== current) {\n        current = cohort.criterion_key;\n        if (refs.length) lines.push('');\n        lines.push(`Criterion ${String.fromCharCode(65 + letter)}: \"${cohort.criterion_text}\"`);\n        letter += 1;\n      }\n      lines.push(`  ${i + 1}. ${describe(cohort.signature)}`);\n      refs.push({ id: i + 1, criterion_key: cohort.criterion_key, signature: cohort.signature });\n    });\n    requests.push({\n      purpose: 'judge_cohorts',\n      prompt_version: PROMPT_VERSION,\n      model: config.llm_model_match,\n      temperature: 0,\n      max_output_tokens: 1024 + 96 * chunk.length,\n      system: SYSTEM,\n      prompt: lines.join('\\n'),\n      schema: schemaFor(chunk.length),\n      cohort_refs: refs,\n      planned_k: k,\n    });\n  }\n  return requests;\n}\n\n// ---- n8n entry point ----\n// The input is the SQL row that found the cohorts; it carries app_config as `config`.\nconst input = $input.first().json;\nconst config = input.config;\nconst cohorts = input.cohorts ?? [];\nconst criteria = input.criteria ?? [];\nconst plan = planBatchSize(cohorts.length, criteria.length, config, input.llm_latency);\nreturn [...buildRequests(cohorts, config, plan), ...compileRequests(criteria, config)].map((json) => ({ json }));\n"
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000010",
+      "name": "Judge cohorts (LLM gateway)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        896,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "lnWfLlmGateway01",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000011",
+      "name": "Attach cohort refs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Attach cohort refs\" (Workflow B and the warm step). Mode: Run Once for All Items.\n//\n// The LLM gateway answers every request in one call and returns one result per request, in\n// request order (request_index), with only { ok, data, calls, tokens, ... }. This puts each\n// request's refs back next to its answer: cohort_refs (question id -> criterion_key + signature)\n// for a judging request, or criteria_refs (rule id -> criterion) for a compile request, so\n// \"Collect verdicts\" can map every answer.\nconst requests = $('Build cohort requests').all().map((item) => item.json);\nreturn $input.all().map((item, i) => {\n  const request = requests[item.json.request_index ?? i];\n  const refs = request.criteria_refs ? { criteria_refs: request.criteria_refs } : { cohort_refs: request.cohort_refs };\n  return { json: { ...item.json, ...refs } };\n});\n"
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000012",
+      "name": "Collect verdicts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Collect verdicts\" (Workflow B). Mode: Run Once for All Items.\n//\n// S4 + S5: turns the gateway's answers back into cache rows. Cohort verdicts are keyed by\n// (criterion_key, signature), so one write fans each verdict out to every user in the cohort.\n// Compiled rules are keyed by criterion_key. An answer that is missing, duplicated or invalid\n// is not cached, so its pairs stay pending_llm (or its criterion uncompiled) and the next run\n// asks again. Nothing is guessed: a malformed clause is dropped, never repaired.\n//\n// Input:  one item per request: { cohort_refs: [{id, criterion_key, signature}] or\n//         criteria_refs: [{id, criterion_key, criterion_text, depends_on}], ok, data, calls,\n//         tokens_in, tokens_out, model, prompt_version, error }\n// Output: one item { decisions: [...], rules: [...], calls, tokens_in, tokens_out, requests,\n//         failed_requests, unanswered }\n\nconst VERDICTS = new Set(['eligible', 'ineligible', 'uncertain']);\nconst CLAUSE_VERDICTS = new Set(['eligible', 'ineligible']);\nconst EMPLOYMENT = new Set(['Salaried', 'Self-Employed', 'Business']);\nconst BOUNDS = ['age_min', 'age_max', 'credit_score_min', 'credit_score_max', 'monthly_income_min', 'monthly_income_max'];\n\n// A clause the SQL can apply, or null. Bounds must be finite numbers or null.\nfunction cleanClause(c) {\n  if (!c || !CLAUSE_VERDICTS.has(c.verdict)) return null;\n  const employment = Array.isArray(c.employment_status) ? c.employment_status : [];\n  if (!employment.every((e) => EMPLOYMENT.has(e))) return null;\n  const out = { verdict: c.verdict, employment_status: [...new Set(employment)] };\n  for (const b of BOUNDS) {\n    const v = c[b] ?? null;\n    if (v !== null && !Number.isFinite(v)) return null;\n    out[b] = v;\n  }\n  return out;\n}\n\nfunction collectRules(r, rules) {\n  const refs = r.criteria_refs ?? [];\n  const byId = new Map();\n  for (const rule of r.data?.rules ?? []) {\n    if (Number.isInteger(rule.id) && Array.isArray(rule.clauses) && !byId.has(rule.id)) byId.set(rule.id, rule);\n  }\n  let unanswered = 0;\n  for (const ref of refs) {\n    const rule = byId.get(ref.id);\n    if (!rule) {\n      unanswered += 1;\n      continue;\n    }\n    rules.push({\n      criterion_key: ref.criterion_key,\n      criterion_text: ref.criterion_text,\n      depends_on: ref.depends_on,\n      clauses: rule.clauses.map(cleanClause).filter(Boolean),\n      note: String(rule.note ?? '').slice(0, 300),\n      model: r.model,\n      prompt_version: r.prompt_version,\n    });\n  }\n  return unanswered;\n}\n\nfunction collect(results) {\n  const decisions = [];\n  const rules = [];\n  let calls = 0;\n  let tokensIn = 0;\n  let tokensOut = 0;\n  let failed = 0;\n  let unanswered = 0;\n  for (const r of results) {\n    calls += r.calls ?? 0;\n    tokensIn += r.tokens_in ?? 0;\n    tokensOut += r.tokens_out ?? 0;\n    const refs = r.cohort_refs ?? [];\n    if (!r.ok) {\n      failed += 1;\n      unanswered += refs.length + (r.criteria_refs ?? []).length;\n      continue;\n    }\n    if (r.criteria_refs) {\n      unanswered += collectRules(r, rules);\n      continue;\n    }\n    const byId = new Map();\n    for (const v of r.data?.verdicts ?? []) {\n      if (Number.isInteger(v.id) && VERDICTS.has(v.verdict) && !byId.has(v.id)) byId.set(v.id, v);\n    }\n    for (const ref of refs) {\n      const v = byId.get(ref.id);\n      if (!v) {\n        unanswered += 1;\n        continue;\n      }\n      decisions.push({\n        criterion_key: ref.criterion_key,\n        signature: ref.signature,\n        verdict: v.verdict,\n        reason: String(v.reason ?? '').slice(0, 300),\n        model: r.model,\n        prompt_version: r.prompt_version,\n      });\n    }\n  }\n  return {\n    decisions,\n    rules,\n    calls,\n    tokens_in: tokensIn,\n    tokens_out: tokensOut,\n    requests: results.length,\n    failed_requests: failed,\n    unanswered,\n  };\n}\n\n// ---- n8n entry point ----\nreturn [{ json: collect($input.all().map((item) => item.json)) }];\n"
+      }
+    },
+    {
+      "id": "0e0e0e0e-0000-4000-8000-000000000013",
+      "name": "Store verdicts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1568,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow B, S4 + S5: cache the LLM's answers and record what the calls cost.\n-- A cohort verdict is keyed by (criterion_key, signature), so it serves every user in the\n-- cohort, in this batch and every later one, until the criterion's wording changes. A compiled\n-- rule is keyed by criterion_key alone and serves every product that shares the criterion.\n--\n-- Parameters: #1 decisions (JSON array from parse_cohort_verdicts.js), #2 batch_id,\n--             #3 execution id, #4 stats JSON {calls, tokens_in, tokens_out, requests,\n--             failed_requests, unanswered}, #5 rules (JSON array from parse_cohort_verdicts.js)\nWITH d AS (\n    SELECT *\n    FROM jsonb_to_recordset($1::jsonb) AS x (\n        criterion_key text, signature text, verdict text, reason text, model text,\n        prompt_version text)\n),\nstored AS (\n    INSERT INTO llm_decisions (criteria_hash, user_signature, verdict, reason, model, prompt_version)\n    SELECT criterion_key, signature, verdict, reason, model, coalesce(prompt_version, 'unknown')\n    FROM d\n    ON CONFLICT (criteria_hash, user_signature) DO NOTHING\n    RETURNING 1\n),\nr AS (\n    SELECT *\n    FROM jsonb_to_recordset(coalesce($5, '[]')::jsonb) AS x (\n        criterion_key text, criterion_text text, depends_on text[], clauses jsonb, note text,\n        model text, prompt_version text)\n),\nrules_stored AS (\n    INSERT INTO criterion_rules (criterion_key, criterion_text, depends_on, clauses, note, model,\n                                 prompt_version)\n    SELECT criterion_key, criterion_text, depends_on, clauses, note, model,\n           coalesce(prompt_version, 'unknown')\n    FROM r\n    ON CONFLICT (criterion_key) DO NOTHING\n    RETURNING 1\n),\nstats AS (\n    SELECT * FROM jsonb_to_record($4::jsonb) AS s (\n        calls integer, tokens_in integer, tokens_out integer, requests integer,\n        failed_requests integer, unanswered integer)\n),\nmetrics AS (\n    INSERT INTO pipeline_metrics (run_id, batch_id, workflow, stage, pairs_in, pairs_out, llm_calls,\n                                  tokens_in, tokens_out, details)\n    SELECT $3, $2::uuid, 'B', 's5_llm',\n           (SELECT count(*) FROM d) + s.unanswered, (SELECT count(*) FROM d),\n           s.calls, s.tokens_in, s.tokens_out,\n           jsonb_build_object('requests', s.requests, 'failed_requests', s.failed_requests,\n                              'unanswered', s.unanswered,\n                              'rules', (SELECT count(*) FROM r),\n                              'rules_stored', (SELECT count(*) FROM rules_stored))\n    FROM stats s\n    RETURNING 1\n)\nSELECT (SELECT count(*) FROM d) AS decisions,\n       (SELECT count(*) FROM stored) AS stored,\n       (SELECT count(*) FROM rules_stored) AS rules_stored,\n       (SELECT count(*) FROM metrics) AS metrics_written;\n",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.decisions), null, $execution.id, JSON.stringify({ calls: $json.calls, tokens_in: $json.tokens_in, tokens_out: $json.tokens_out, requests: $json.requests, failed_requests: $json.failed_requests, unanswered: $json.unanswered }), JSON.stringify($json.rules ?? []) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Called by A": {
+      "main": [
+        [
+          {
+            "node": "Find unjudged cohorts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Find unjudged cohorts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find unjudged cohorts": {
+      "main": [
+        [
+          {
+            "node": "LLM needed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM needed?": {
+      "main": [
+        [
+          {
+            "node": "Build cohort requests",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing to judge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build cohort requests": {
+      "main": [
+        [
+          {
+            "node": "Judge cohorts (LLM gateway)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Judge cohorts (LLM gateway)": {
+      "main": [
+        [
+          {
+            "node": "Attach cohort refs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach cohort refs": {
+      "main": [
+        [
+          {
+            "node": "Collect verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect verdicts": {
+      "main": [
+        [
+          {
+            "node": "Store verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  },
+  "active": false,
+  "pinData": {}
+}

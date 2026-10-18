@@ -1,0 +1,28 @@
+{
+  "entries": [
+    {
+      "file": "robots.txt",
+      "url": "https://www.bankbazaar.com/robots.txt",
+      "status": 200,
+      "bytes": 3721,
+      "sha256": "a4aa73162de5153d0c0e9544d9159a80353b1e7117977f5675de90a04c029627",
+      "fetched_at": "2026-10-16T10:10:29+00:00"
+    },
+    {
+      "file": "personal-loan.html",
+      "url": "https://www.bankbazaar.com/personal-loan.html",
+      "status": 200,
+      "bytes": 493193,
+      "sha256": "6fa7b1f3e286015e5234b9a8022561bd46e23d050eae67888acb2d822279f05b",
+      "fetched_at": "2026-10-16T10:10:35+00:00"
+    },
+    {
+      "file": "personal-loan-eligibility.html",
+      "url": "https://www.bankbazaar.com/personal-loan-eligibility.html",
+      "status": 200,
+      "bytes": 218237,
+      "sha256": "5c63011a57ac42e9584a7ef41ab32184919c36e30724b34dc0291f317032d604",
+      "fetched_at": "2026-10-16T10:10:40+00:00"
+    }
+  ]
+}

@@ -1,0 +1,378 @@
+{
+  "name": "LLM gateway (sub-workflow)",
+  "nodes": [
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000101",
+      "name": "About this gateway",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -224
+      ],
+      "parameters": {
+        "width": 1088,
+        "height": 176,
+        "content": "## LLM gateway\nThe only workflow that talks to an LLM provider, so the provider can be swapped in one place (Gemini today).\n**In:** one item per request, `{ purpose, model, system, prompt, schema, temperature, max_output_tokens }`, from Workflow A (crawl-time extraction), Workflow B or the warm step (fuzzy cohorts). Several requests go out `llm_concurrency` at a time, paced under `llm_rpm`.\n**Out:** one item per request, in request order: `{ request_index, ok, data, error, calls, tokens_in, tokens_out }`, always this shape.\nGuards: the daily free-tier budget (`llm_rpd`) is checked before every call (**Load app_config** reads the switches and today's usage in one query, so a call costs two database round trips: that one and the log). 429/5xx responses back off (honouring RetryInfo) up to `llm_max_retries`. Every attempt is logged in `llm_calls`."
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000001",
+      "name": "Called by A or B",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        304
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000002",
+      "name": "Load app_config",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/llm/config_and_usage.sql",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000004",
+      "name": "Build provider request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        304
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/llm_request.js"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000005",
+      "name": "Within daily budget?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        672,
+        304
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0d0d0d0d-0000-4000-8000-0000000000c1",
+              "leftValue": "={{ $json.within_budget }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000006",
+      "name": "Call provider",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        896,
+        208
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 180000,
+          "batching": {
+            "batch": {
+              "batchSize": "={{ $json.batch_size }}",
+              "batchInterval": "={{ $json.batch_interval_ms }}"
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": "@@credential:gemini_api"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000007",
+      "name": "Parse provider response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        208
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/llm_response.js"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000008",
+      "name": "Log LLM call",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1344,
+        208
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/llm/log_call.sql",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id, $json.purpose, $json.provider, $json.model, $json.attempt, $json.http_status || null, $json.outcome, $json.tokens_in, $json.tokens_out, $json.duration_ms, $json.ok ? null : $json.error ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000009",
+      "name": "Restore response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        208
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/restore_response.js"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000010",
+      "name": "Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1792,
+        208
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0d0d0d0d-0000-4000-8000-0000000000c2",
+              "leftValue": "={{ $json.retry }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000011",
+      "name": "Back off",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1792,
+        0
+      ],
+      "webhookId": "0d0d0d0d-0000-4000-8000-0000000000d1",
+      "parameters": {
+        "amount": "={{ $json.wait_seconds }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000012",
+      "name": "Return result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        400
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/llm_result.js"
+      }
+    }
+  ],
+  "connections": {
+    "Called by A or B": {
+      "main": [
+        [
+          {
+            "node": "Load app_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load app_config": {
+      "main": [
+        [
+          {
+            "node": "Build provider request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build provider request": {
+      "main": [
+        [
+          {
+            "node": "Within daily budget?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Within daily budget?": {
+      "main": [
+        [
+          {
+            "node": "Call provider",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call provider": {
+      "main": [
+        [
+          {
+            "node": "Parse provider response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse provider response": {
+      "main": [
+        [
+          {
+            "node": "Log LLM call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log LLM call": {
+      "main": [
+        [
+          {
+            "node": "Restore response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore response": {
+      "main": [
+        [
+          {
+            "node": "Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry?": {
+      "main": [
+        [
+          {
+            "node": "Back off",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Back off": {
+      "main": [
+        [
+          {
+            "node": "Call provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  }
+}

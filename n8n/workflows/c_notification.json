@@ -1,0 +1,427 @@
+{
+  "id": "lnWfNotificatio1",
+  "name": "C · User notification",
+  "nodes": [
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000001",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -448
+      ],
+      "parameters": {
+        "width": 1360,
+        "height": 260,
+        "content": "## C · User notification\nRuns after Workflow B has written a batch's matches (or manually, for the most recent matched batch). One database round trip when nothing is sent, plus one per email sent.\n1. **Plan notifications** (one SQL statement): read `app_config` and refuse to record anything unless `EMAIL_MODE` is `suppressed` or `test_aliases` and the cap, aliases and sender are valid; record every user with new matches. In `test_aliases` mode the first `EMAIL_CAP` users are `pending` with a test alias as recipient; everyone else is `suppressed`. With nothing pending the batch is closed here. A rerun finds them all recorded and sends nothing.\n2. **Check email settings**: the same checks again in code; stops the workflow with the reason.\n3. **Render emails** for those users only. In `suppressed` mode they are previews and stop here.\n4. **Check recipients**, then one email at a time: send through SES, record the result (the last one closes the batch), pause to stay under the SES rate.\nn8n never holds more than `EMAIL_CAP` emails, and never a user's real address."
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000002",
+      "name": "Never the CSV address",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1376,
+        -448
+      ],
+      "parameters": {
+        "width": 1120,
+        "height": 260,
+        "content": "### Who can receive an email\n* The planning query never selects `users.email`: the address from the upload cannot reach this workflow.\n* Recipients come only from `EMAIL_ALIASES`, and only in `test_aliases` mode.\n* `EMAIL_CAP` is applied twice: in the query (only that many become `pending`) and in **Check recipients**.\n* **Check recipients** stops everything unless every recipient is one of the aliases, used once, and the sender is `SES_SENDER`.\n* The SES credential is a send-only IAM user, never the owner's admin keys; the SES sandbox (verified identities only) is the second layer."
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000003",
+      "name": "Called by Workflow B",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000004",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        192
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000006",
+      "name": "Check email settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        96
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Check email settings\" (Workflow C). Mode: Run Once for All Items.\n//\n// Workflow C refuses to run unless the email switches are explicitly safe (DECISIONS AD5):\n// EMAIL_MODE is exactly 'suppressed' or 'test_aliases', the aliases are valid and distinct,\n// EMAIL_CAP is between 1 and the number of aliases, and the sender is an address. The planning\n// query applies the same rules before it records anything (it reads app_config itself, to save\n// a round trip) and returns config_error instead; this node then stops the workflow with the\n// reason, before anything is rendered or sent. bootstrap validates the same values, so either\n// check only fires if app_config was edited by hand.\n//\n// Input:  one item from \"Plan notifications\": { config, config_error, ... }\n// Output: one item { mode, aliases, cap, sender, pause_seconds }.\n\nconst MODES = new Set(['suppressed', 'test_aliases']);\nconst EMAIL = /^[^@\\s,]+@[^@\\s,]+\\.[^@\\s,]+$/;\n\nfunction emailSettings(config) {\n  const mode = String(config.email_mode ?? '');\n  if (!MODES.has(mode)) {\n    throw new Error(`EMAIL_MODE must be \"suppressed\" or \"test_aliases\", not ${JSON.stringify(mode)}: refusing to run`);\n  }\n  const aliases = String(config.email_aliases ?? '').split(',').map((a) => a.trim()).filter(Boolean);\n  if (!aliases.length || !aliases.every((a) => EMAIL.test(a))) {\n    throw new Error('EMAIL_ALIASES must be a comma-separated list of email addresses: refusing to run');\n  }\n  if (new Set(aliases.map((a) => a.toLowerCase())).size !== aliases.length) {\n    throw new Error('EMAIL_ALIASES lists the same address twice: refusing to run');\n  }\n  const cap = Number(config.email_cap);\n  if (!Number.isInteger(cap) || cap < 1 || cap > aliases.length) {\n    throw new Error(`EMAIL_CAP must be between 1 and ${aliases.length} (the number of aliases): refusing to run`);\n  }\n  const sender = String(config.ses_sender ?? '');\n  if (!EMAIL.test(sender)) throw new Error('SES_SENDER is not an email address: refusing to run');\n  const perSecond = Number(config.ses_max_per_second);\n  if (!(perSecond > 0)) throw new Error('SES_MAX_PER_SECOND must be a positive number: refusing to run');\n  return { mode, aliases, cap, sender, pause_seconds: Math.ceil(1000 / perSecond) / 1000 };\n}\n\nfunction checkPlan(plan) {\n  const settings = emailSettings(plan.config ?? {});\n  if (plan.config_error) throw new Error(`${plan.config_error}: refusing to run`);\n  return settings;\n}\n\n// ---- n8n entry point ----\nreturn [{ json: checkPlan($input.first().json) }];\n"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000007",
+      "name": "Plan notifications",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        96
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow C, first statement: decide who gets an email for this batch, record everyone, and build the\n-- content of the few emails that will be rendered. One statement, so the decision is atomic.\n--\n-- * Candidates: users of the batch whose user_matches row has offers to announce (to_announce:\n--   matched or llm_matched pairs no email announced yet) and no notifications row for this\n--   batch yet. A rerun finds\n--   every user already recorded and does nothing. Suppressed rows keep an empty product_ids:\n--   nothing was announced to them, and their matches are in the matches table.\n-- * In test_aliases mode the first EMAIL_CAP candidates (by user id, so a rerun of a fresh\n--   batch picks the same people) get status 'pending' and a recipient taken from\n--   EMAIL_ALIASES, in order. Everyone else is recorded 'suppressed' in the same INSERT. In\n--   suppressed mode everyone is 'suppressed'.\n-- * Email content is built only for those first EMAIL_CAP users: in suppressed mode as a\n--   preview that is rendered and never sent. users.email is never selected: the address from\n--   the CSV cannot reach the workflow.\n-- * The same product is often listed twice, by an aggregator and by the lender itself\n--   (\"HDFC Bank Personal Loan\" on BankBazaar, \"HDFC Personal Loan\" on hdfc.bank.in). An email\n--   shows each (lender, product) once, preferring the lender's own page, then a stated rate,\n--   then the lowest rate. Products are compared by their identity_key (lender + name without\n--   punctuation, \"Bank\", \"Ltd\" or the lender's own name; migration 010).\n-- * One round trip (docs/DECISIONS.md AD27). The statement reads app_config itself and checks\n--   the email switches with the same rules as the \"Check email settings\" Code node (AD5)\n--   before anything is recorded: with a hand-edited app_config it claims and records nothing\n--   and returns config_error, and the Code node then stops the workflow with the reason.\n-- * It also closes the batch when there is nothing to send (suppressed mode, or a rerun):\n--   'notified' straight away, with the notify metric. Otherwise the batch is 'notifying', and\n--   the last recorded email closes it (record_notification.sql).\n--\n-- * JIT is off: the planner estimates this statement at about 1.5M, so JIT compiled it for\n--   0.7 s every run, while it executes in about 0.25 s at 10k users (1.25 s -> 0.27 s).\n--\n-- Parameters: #1 batch_id ('' = the most recently matched batch), #2 execution id\nSET LOCAL jit = off;\n\nWITH config AS (\n    SELECT jsonb_object_agg(key, value) AS config FROM app_config\n),\nsettings AS (\n    SELECT c.config,\n           coalesce(c.config ->> 'email_mode', '') AS mode,\n           a.aliases,\n           CASE WHEN c.config ->> 'email_cap' ~ '^[0-9]+$' AND length(c.config ->> 'email_cap') <= 4\n                THEN (c.config ->> 'email_cap')::integer END AS cap,\n           coalesce(c.config ->> 'ses_sender', '') AS sender,\n           coalesce(c.config ->> 'ses_max_per_second', '') AS per_second\n    FROM config c,\n         LATERAL (SELECT coalesce(array_agg(btrim(x) ORDER BY o) FILTER (WHERE btrim(x) <> ''),\n                                  '{}') AS aliases\n                  FROM unnest(string_to_array(coalesce(c.config ->> 'email_aliases', ''), ','))\n                       WITH ORDINALITY AS u (x, o)) a\n),\n-- CASE, not AND, guards each cast: Postgres does not promise to evaluate AND left to right.\nchecked AS MATERIALIZED (\n    SELECT s.*,\n           CASE\n               WHEN s.mode NOT IN ('suppressed', 'test_aliases')\n                   THEN 'EMAIL_MODE must be \"suppressed\" or \"test_aliases\"'\n               WHEN cardinality(s.aliases) = 0\n                    OR EXISTS (SELECT 1 FROM unnest(s.aliases) x\n                               WHERE x !~ '^[^@\\s,]+@[^@\\s,]+\\.[^@\\s,]+$')\n                   THEN 'EMAIL_ALIASES must be a comma-separated list of email addresses'\n               WHEN (SELECT count(DISTINCT lower(x)) FROM unnest(s.aliases) x)\n                    <> cardinality(s.aliases)\n                   THEN 'EMAIL_ALIASES lists the same address twice'\n               WHEN s.cap IS NULL OR s.cap < 1 OR s.cap > cardinality(s.aliases)\n                   THEN 'EMAIL_CAP must be between 1 and ' || cardinality(s.aliases)\n                        || ' (the number of aliases)'\n               WHEN s.sender !~ '^[^@\\s,]+@[^@\\s,]+\\.[^@\\s,]+$'\n                   THEN 'SES_SENDER is not an email address'\n               WHEN NOT CASE WHEN s.per_second ~ '^[0-9]+(\\.[0-9]+)?$'\n                             THEN s.per_second::numeric > 0 ELSE false END\n                   THEN 'SES_MAX_PER_SECOND must be a positive number'\n           END AS config_error\n    FROM settings s\n),\ntarget AS (\n    SELECT coalesce(\n               nullif($1, '')::uuid,\n               (SELECT batch_id FROM ingestion_batches\n                WHERE status IN ('matched', 'notifying')\n                ORDER BY matched_at DESC NULLS LAST LIMIT 1)\n           ) AS batch_id\n),\n-- The batch's own user_matches rows, found through the BRIN index: a batch's rows were written\n-- together, so they sit side by side, and one row per user says whether there are offers to\n-- announce. The batch id is read as a scalar subquery (a plan parameter), so the anti-join can\n-- use the (batch_id, user_id) index instead of reading every notification ever recorded.\ncandidates AS MATERIALIZED (\n    SELECT m.user_id\n    FROM user_matches m\n    WHERE m.batch_id = (SELECT batch_id FROM target)\n      AND m.to_announce\n      AND (SELECT config_error IS NULL FROM checked)\n      AND NOT EXISTS (\n          SELECT 1 FROM notifications n\n          WHERE n.batch_id = (SELECT batch_id FROM target) AND n.user_id = m.user_id\n      )\n),\nplanned AS MATERIALIZED (\n    SELECT r.user_id, r.rn,\n           CASE WHEN s.mode = 'test_aliases' AND r.rn <= s.cap THEN 'pending' ELSE 'suppressed' END\n               AS status,\n           CASE WHEN s.mode = 'test_aliases' AND r.rn <= s.cap THEN s.aliases[r.rn::integer] END\n               AS recipient\n    FROM (SELECT c.*, row_number() OVER (ORDER BY c.user_id) AS rn FROM candidates c) r,\n         checked s\n),\n-- product_ids lists what an email announces, so it is filled only for emails about to be sent.\nrecorded AS (\n    INSERT INTO notifications (batch_id, user_id, status, email_mode, recipient, product_ids)\n    SELECT t.batch_id, p.user_id, p.status, (SELECT mode FROM checked), p.recipient,\n           CASE WHEN p.status = 'pending' THEN ARRAY(\n               SELECT x.product_id FROM user_matches m, unnest(m.product_ids, m.statuses) AS x (product_id, status)\n               WHERE m.batch_id = t.batch_id AND m.user_id = p.user_id\n                 AND x.status IN ('matched', 'llm_matched')\n               ORDER BY x.product_id)\n           ELSE '{}' END\n    FROM planned p, target t\n    WHERE t.batch_id IS NOT NULL\n    ORDER BY p.user_id\n    ON CONFLICT (batch_id, user_id) DO NOTHING\n    RETURNING notification_id, user_id, status, recipient\n),\nto_render AS MATERIALIZED (\n    SELECT r.notification_id, r.user_id, r.status, r.recipient, p.rn, u.name\n    FROM recorded r\n    JOIN planned p USING (user_id)\n    JOIN users u USING (user_id)\n    WHERE p.rn <= (SELECT cap FROM checked)\n),\noffers AS (\n    SELECT tr.notification_id, x.status AS match_status,\n           coalesce(ARRAY(SELECT jsonb_array_elements_text(m.details -> x.product_id::text -> 'caveats')), '{}') AS caveats,\n           p.lender, p.product_name, p.interest_rate_min, p.interest_rate_max,\n           ARRAY(SELECT c ->> 'text' FROM jsonb_array_elements(p.soft_criteria) c\n                 WHERE c ->> 'class' = 'unknown_field') AS conditions,\n           row_number() OVER (\n               PARTITION BY tr.notification_id, p.identity_key\n               ORDER BY (s.kind = 'lender') DESC, (p.interest_rate_min IS NULL),\n                        p.interest_rate_min, length(p.product_name) DESC, p.product_id\n           ) AS pick\n    FROM to_render tr\n    JOIN user_matches m\n      ON m.batch_id = (SELECT batch_id FROM target) AND m.user_id = tr.user_id\n    CROSS JOIN LATERAL unnest(m.product_ids, m.statuses) AS x (product_id, status)\n    JOIN loan_products p ON p.product_id = x.product_id\n    JOIN crawl_sources s ON s.source_id = p.source_id\n    WHERE x.status IN ('matched', 'llm_matched')\n),\nemails AS (\n    SELECT tr.notification_id, tr.user_id, tr.status, tr.recipient, tr.rn, tr.name,\n           coalesce((\n               SELECT jsonb_agg(jsonb_build_object(\n                          'lender', o.lender, 'product', o.product_name,\n                          'rate_min', o.interest_rate_min, 'rate_max', o.interest_rate_max,\n                          'status', o.match_status, 'caveats', to_jsonb(o.caveats),\n                          'conditions', to_jsonb(o.conditions))\n                      ORDER BY (o.match_status = 'matched') DESC, o.interest_rate_min NULLS LAST,\n                               o.lender, o.product_name)\n               FROM offers o\n               WHERE o.notification_id = tr.notification_id AND o.pick = 1\n           ), '[]'::jsonb) AS products\n    FROM to_render tr\n),\ncounts AS (\n    SELECT count(*) FILTER (WHERE status = 'pending') AS to_send,\n           count(*) FILTER (WHERE status = 'suppressed') AS suppressed,\n           round(extract(epoch FROM clock_timestamp() - statement_timestamp()) * 1000)::integer AS ms\n    FROM recorded\n),\n-- Nothing pending means nothing to send: the batch is closed here. A batch left 'notifying' by\n-- an earlier run is closed by a rerun too; its leftover pending rows are never sent (SES may\n-- already have sent them) and show up in the notify metric.\nclaimed AS (\n    UPDATE ingestion_batches b\n    SET status = CASE WHEN c.to_send > 0 THEN 'notifying' ELSE 'notified' END,\n        notified_at = CASE WHEN c.to_send > 0 THEN b.notified_at ELSE now() END\n    FROM target t, counts c, checked s\n    WHERE s.config_error IS NULL\n      AND b.batch_id = t.batch_id AND b.status IN ('matched', 'notifying')\n    RETURNING b.status\n),\n-- Every notification of the batch: the snapshot (earlier runs) plus the rows written above.\ntally AS (\n    SELECT count(*) FILTER (WHERE status = 'sent') AS sent,\n           count(*) FILTER (WHERE status = 'suppressed') AS suppressed,\n           count(*) FILTER (WHERE status = 'failed') AS failed,\n           count(*) FILTER (WHERE status = 'pending') AS pending\n    FROM (SELECT status FROM notifications WHERE batch_id = (SELECT batch_id FROM target)\n          UNION ALL\n          SELECT status FROM recorded) n\n),\nmetrics AS (\n    INSERT INTO pipeline_metrics (run_id, batch_id, workflow, stage, pairs_in, pairs_out, duration_ms, details)\n    SELECT $2, t.batch_id, 'C', v.stage, v.pairs_in, v.pairs_out, v.ms, v.details\n    FROM target t, counts c, tally y, checked s,\n         LATERAL (VALUES\n             ('plan_notifications', (SELECT count(*) FROM candidates), c.to_send, c.ms,\n              jsonb_build_object('email_mode', s.mode, 'email_cap', s.cap,\n                                 'suppressed', c.suppressed),\n              true),\n             ('notify', y.sent + y.suppressed + y.failed + y.pending, y.sent, NULL::integer,\n              jsonb_build_object('sent', y.sent, 'suppressed', y.suppressed,\n                                 'failed', y.failed, 'pending', y.pending),\n              EXISTS (SELECT 1 FROM claimed WHERE status = 'notified'))\n         ) AS v (stage, pairs_in, pairs_out, ms, details, wanted)\n    WHERE t.batch_id IS NOT NULL AND s.config_error IS NULL AND v.wanted\n    RETURNING 1\n)\nSELECT t.batch_id::text AS batch_id,\n       s.config_error,\n       s.config,\n       s.mode AS email_mode,\n       (SELECT count(*) FROM candidates) AS users_with_matches,\n       c.to_send,\n       c.suppressed,\n       (SELECT status FROM claimed) AS batch_status,\n       (SELECT count(*) FROM metrics) AS metrics_written,\n       coalesce((SELECT jsonb_agg(to_jsonb(e) ORDER BY e.rn) FROM emails e), '[]'::jsonb) AS emails\nFROM target t, counts c, checked s;\n",
+        "options": {
+          "queryReplacement": "={{ [ $('Called by Workflow B').isExecuted ? String($('Called by Workflow B').first().json.batch_id ?? '') : '', $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000008",
+      "name": "Render emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        96
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Render emails\" (Workflow C). Mode: Run Once for All Items.\n//\n// One email per planned user (at most EMAIL_CAP): greeted by first name, then the products whose\n// published criteria include them, then the ones they \"may qualify\" for with what to check\n// first. In suppressed mode the same emails are rendered as previews and never sent\n// (send: false). Everything that came from the CSV or a crawled page is HTML-escaped. The\n// recipient is the test alias the planning query chose; no CSV address ever reaches this node.\n//\n// Input:  the \"Plan notifications\" row { batch_id, email_mode, emails: [...] } (read by name:\n//         this node's own input is the settings check)\n// Output: one item per email { notification_id, send, to, from, subject, html, text, products },\n//         or a single { none: true, send: false } when there is nobody to email.\n\nconst MAX_CONDITIONS = 2;\n// n8n's SES node sends the message as query parameters of the request URL (Action=SendEmail),\n// and the SES endpoint refuses URLs over about 16 KB with \"414 Request-URI Too Large\"\n// (measured: 9 KB accepted, 18 KB refused; docs/DECISIONS.md V41). So the HTML is kept under\n// this budget, measured exactly as the node encodes it, showing the best rates first and\n// summing up the rest in one line.\nconst HTML_BUDGET = 7000;\n\nfunction escapeHtml(value) {\n  const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' };\n  return String(value ?? '').replace(/[&<>\"']/g, (c) => map[c]);\n}\n\nfunction percent(v) {\n  return `${Number(v).toFixed(2).replace(/\\.?0+$/, '')}%`;\n}\n\nfunction rateText(p) {\n  if (p.rate_min != null && p.rate_max != null) return `${percent(p.rate_min)}–${percent(p.rate_max)} a year`;\n  if (p.rate_min != null) return `from ${percent(p.rate_min)} a year`;\n  if (p.rate_max != null) return `up to ${percent(p.rate_max)} a year`;\n  return 'rate not published';\n}\n\n// What the user should still check: row caveats (\"May not apply: ...\") and the lender's own\n// conditions the data can't verify (work experience, city, ...), at most two of the latter.\nfunction notesFor(p) {\n  const notes = [];\n  for (const c of p.caveats ?? []) {\n    notes.push(c.startsWith('May not apply: ') ? `Check first: ${c.slice('May not apply: '.length)}`\n      : c.startsWith('Not checked: ') ? `Not checked yet: ${c.slice('Not checked: '.length)}` : c);\n  }\n  const conditions = p.conditions ?? [];\n  if (conditions.length) {\n    const more = conditions.length > MAX_CONDITIONS ? ` (+${conditions.length - MAX_CONDITIONS} more)` : '';\n    notes.push(`The lender also asks for: ${conditions.slice(0, MAX_CONDITIONS).join('; ')}${more}`);\n  }\n  return notes;\n}\n\nfunction firstName(name) {\n  return String(name ?? '').trim().split(/\\s+/)[0] || 'there';\n}\n\nfunction htmlRow(p) {\n  const notes = notesFor(p).map((n) => `<br><span style=\"color:#5a6476;font-size:13px\">${escapeHtml(n)}</span>`).join('');\n  return `<tr><td style=\"padding:10px 28px;border-top:1px solid #eef1f5;font-size:15px;line-height:1.45\">`\n    + `<strong>${escapeHtml(p.lender)}</strong> · ${escapeHtml(p.product)}`\n    + `<br><span style=\"color:#17202b;font-size:13px\">${escapeHtml(rateText(p))}</span>${notes}</td></tr>`;\n}\n\nfunction htmlSection(title, intro, products) {\n  if (!products.length) return '';\n  return `<tr><td style=\"padding:18px 28px 6px\"><h2 style=\"margin:0;font-size:16px\">${escapeHtml(title)}</h2>`\n    + `<p style=\"margin:4px 0 0;color:#5a6476;font-size:13px\">${escapeHtml(intro)}</p></td></tr>`\n    + products.map(htmlRow).join('');\n}\n\nconst FOOTER = 'This is a test email from the Loan Eligibility Engine demo. It was sent to a test inbox, '\n  + 'not to the address in the uploaded file. Eligibility is checked against the criteria lenders '\n  + 'publish; it is not an offer or an approval of credit.';\n\nconst byRate = (a, b) => (a.rate_min ?? Infinity) - (b.rate_min ?? Infinity)\n  || String(a.lender).localeCompare(String(b.lender));\n\nfunction moreRow(hidden) {\n  if (!hidden) return '';\n  return `<tr><td style=\"padding:10px 28px;border-top:1px solid #eef1f5;font-size:14px;color:#5a6476\">`\n    + `…and ${hidden} more product${hidden === 1 ? '' : 's'} you may qualify for.</td></tr>`;\n}\n\nfunction render(email, settings) {\n  const first = firstName(email.name);\n  const products = email.products ?? [];\n  const meets = products.filter((p) => p.status === 'matched').sort(byRate);\n  const maybe = products.filter((p) => p.status !== 'matched').sort(byRate);\n  const n = products.length;\n  const subject = `[Test] ${first}, ${n} personal loan${n === 1 ? '' : 's'} you may qualify for`;\n  let shown = n;\n  let html = page(first, n, meets, maybe, shown);\n  while (shown > 1 && encodeURIComponent(html).length > HTML_BUDGET) {\n    shown -= 1;\n    html = page(first, n, meets, maybe, shown);\n  }\n  const textRows = (list) => list.map((p) => [`- ${p.lender}: ${p.product} (${rateText(p)})`,\n    ...notesFor(p).map((note) => `    ${note}`)].join('\\n'));\n  const text = [`Hi ${first},`, '', `${n} personal loan${n === 1 ? '' : 's'} may suit you.`,\n    ...(meets.length ? ['', 'You meet the published criteria:', ...textRows(meets)] : []),\n    ...(maybe.length ? ['', 'You may also qualify:', ...textRows(maybe)] : []),\n    '', FOOTER].join('\\n');\n  return {\n    notification_id: email.notification_id,\n    user_id: email.user_id,\n    send: settings.mode === 'test_aliases' && email.status === 'pending',\n    to: email.recipient ?? null,\n    from: settings.sender,\n    subject,\n    html,\n    text,\n    products: n,\n    products_shown: shown,\n  };\n}\n\n// The HTML email with the first `shown` products (meeting the criteria first, best rate first).\nfunction page(first, n, meets, maybe, shown) {\n  const m = meets.slice(0, shown);\n  const y = maybe.slice(0, Math.max(0, shown - m.length));\n  return '<!doctype html><html><body style=\"margin:0;padding:0;background:#f5f7fa;'\n    + 'font-family:Arial,Helvetica,sans-serif;color:#17202b\">'\n    + '<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f5f7fa\">'\n    + '<tr><td align=\"center\" style=\"padding:24px 12px\">'\n    + '<table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"max-width:600px;width:100%;'\n    + 'background:#ffffff;border:1px solid #dae0e8;border-radius:8px\">'\n    + '<tr><td style=\"padding:24px 28px 4px\">'\n    + '<p style=\"margin:0 0 6px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:#5a6476\">Loan Eligibility Engine</p>'\n    + `<h1 style=\"margin:0 0 10px;font-size:22px;line-height:1.3\">Hi ${escapeHtml(first)}, ${n} personal loan${n === 1 ? '' : 's'} may suit you</h1>`\n    + '<p style=\"margin:0;font-size:15px;line-height:1.5\">We compared the details from your recent application '\n    + 'with the eligibility rules lenders publish. These products include people with your profile.</p>'\n    + '</td></tr>'\n    + htmlSection('You meet the published criteria', 'Income, credit score, age and employment all fit.', m)\n    + htmlSection('You may also qualify', 'Part of the criteria can’t be checked from your details; see the note under each.', y)\n    + moreRow(n - m.length - y.length)\n    + `<tr><td style=\"padding:20px 28px 24px;color:#5a6476;font-size:12px;line-height:1.5;border-top:1px solid #eef1f5\">${escapeHtml(FOOTER)}</td></tr>`\n    + '</table></td></tr></table></body></html>';\n}\n\n// ---- n8n entry point ----\nconst settings = $('Check email settings').first().json;\nconst emails = $('Plan notifications').first().json.emails ?? [];\nconst rendered = emails.map((email) => render(email, settings));\nreturn (rendered.length ? rendered : [{ none: true, send: false }]).map((json) => ({ json }));\n"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000009",
+      "name": "Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        96
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0c0c0c0c-0000-4000-8000-000000000101",
+              "leftValue": "={{ $json.send === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000010",
+      "name": "Check recipients",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Check recipients\" (Workflow C). Mode: Run Once for All Items.\n//\n// The last check before the SES node, independent of the planning query that chose the\n// recipients. It stops the workflow, sending nothing, unless all of these hold:\n//   * EMAIL_MODE is test_aliases;\n//   * there are no more emails than EMAIL_CAP;\n//   * every recipient is exactly one of EMAIL_ALIASES, and no alias is used twice;\n//   * the sender is SES_SENDER.\n// The SES sandbox (only verified identities can receive) is the second layer behind this one.\n\nfunction checkRecipients(emails, settings) {\n  if (settings.mode !== 'test_aliases') throw new Error('refusing to send: EMAIL_MODE is not test_aliases');\n  if (emails.length > settings.cap) {\n    throw new Error(`refusing to send ${emails.length} emails: EMAIL_CAP is ${settings.cap}`);\n  }\n  const allowed = new Set(settings.aliases.map((a) => a.toLowerCase()));\n  const used = new Set();\n  for (const email of emails) {\n    const to = typeof email.to === 'string' ? email.to.toLowerCase() : '';\n    if (!email.send || !allowed.has(to)) {\n      throw new Error(`refusing to send to ${JSON.stringify(email.to)}: not one of EMAIL_ALIASES`);\n    }\n    if (used.has(to)) throw new Error(`refusing to send: ${email.to} would get two emails`);\n    used.add(to);\n    if (email.from !== settings.sender) throw new Error('refusing to send: the sender is not SES_SENDER');\n  }\n  return emails;\n}\n\n// ---- n8n entry point ----\nconst settings = $('Check email settings').first().json;\nreturn checkRecipients($input.all().map((item) => item.json), settings).map((json) => ({ json }));\n"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000011",
+      "name": "Loop over emails",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1568,
+        0
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": "={{ $prevNode.name === 'Check recipients' }}"
+        }
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000012",
+      "name": "Send email (AWS SES)",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1792,
+        -160
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "authentication": "iam",
+        "resource": "email",
+        "operation": "send",
+        "isBodyHtml": true,
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": "={{ [ $json.to ] }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "aws": {
+          "id": "lnAwsSesSender01",
+          "name": "AWS SES (send-only IAM user)"
+        }
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000013",
+      "name": "Read SES result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        -160
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Read SES result\" (Workflow C). Mode: Run Once for All Items.\n//\n// The SES node returns only SES's response (or, on its error output, the error), so the email\n// it was sending comes from the loop (one email per pass). An email counts as sent only if SES\n// returned a message id.\n//\n// Output: one item { notification_id, outcome: 'sent' | 'failed', ses_message_id, error }.\n\nfunction sesOutcome(response) {\n  const id = response?.SendEmailResponse?.SendEmailResult?.MessageId\n    ?? response?.SendEmailResult?.MessageId\n    ?? response?.MessageId\n    ?? null;\n  if (response?.error || !id) {\n    const error = response?.message ?? response?.error?.message\n      ?? (response?.error ? JSON.stringify(response.error) : 'SES returned no message id');\n    return { outcome: 'failed', ses_message_id: '', error: String(error) };\n  }\n  return { outcome: 'sent', ses_message_id: String(id), error: '' };\n}\n\n// ---- n8n entry point ----\nconst email = $('Loop over emails').first().json;\nreturn [{ json: { notification_id: email.notification_id, ...sesOutcome($input.first().json) } }];\n"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000014",
+      "name": "Record result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2240,
+        -160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Workflow C, once per email: record what SES did with one pending email.\n-- 'sent' also clears the user's to_announce and stamps notified_at, so the user is announced\n-- again only when a later write changes their offers. Only a 'pending' row changes, so a repeated call is a no-op.\n-- The batch's last pending email also closes the batch ('notified') and writes the notify\n-- metric, so Workflow C needs no separate finishing statement (docs/DECISIONS.md AD27). Emails\n-- are recorded one at a time by one run, so \"last\" is well defined.\n-- Parameters: #1 notification_id, #2 outcome ('sent' | 'failed'), #3 SES message id,\n--             #4 error message, #5 execution id\nWITH updated AS (\n    UPDATE notifications\n    SET status = $2,\n        ses_message_id = nullif($3, ''),\n        error = nullif(left($4, 2000), ''),\n        sent_at = CASE WHEN $2 = 'sent' THEN now() END\n    WHERE notification_id = $1::bigint AND status = 'pending'\n    RETURNING batch_id, user_id, status\n),\nmarked AS (\n    UPDATE user_matches m\n    SET to_announce = false, notified_at = now()\n    FROM updated u\n    WHERE u.status = 'sent'\n      AND m.batch_id = u.batch_id AND m.user_id = u.user_id AND m.to_announce\n    RETURNING (SELECT count(*) FROM unnest(m.statuses) AS s WHERE s IN ('matched', 'llm_matched')) AS offers\n),\n-- The batch's notifications with this one at its new status (the snapshot still shows it as\n-- pending, so it is counted from updated instead).\ntally AS (\n    SELECT u.batch_id,\n           count(*) FILTER (WHERE n.status = 'sent') AS sent,\n           count(*) FILTER (WHERE n.status = 'suppressed') AS suppressed,\n           count(*) FILTER (WHERE n.status = 'failed') AS failed,\n           count(*) FILTER (WHERE n.status = 'pending') AS pending\n    FROM updated u\n    JOIN LATERAL (\n        SELECT status FROM notifications\n        WHERE batch_id = u.batch_id AND notification_id <> $1::bigint\n        UNION ALL\n        SELECT u.status\n    ) n ON true\n    GROUP BY u.batch_id\n),\nclosed AS (\n    UPDATE ingestion_batches b\n    SET status = 'notified', notified_at = now()\n    FROM tally t\n    WHERE b.batch_id = t.batch_id AND b.status = 'notifying' AND t.pending = 0\n    RETURNING b.batch_id\n),\nmetrics AS (\n    INSERT INTO pipeline_metrics (run_id, batch_id, workflow, stage, pairs_in, pairs_out, details)\n    SELECT $5, t.batch_id, 'C', 'notify', t.sent + t.suppressed + t.failed + t.pending, t.sent,\n           jsonb_build_object('sent', t.sent, 'suppressed', t.suppressed,\n                              'failed', t.failed, 'pending', t.pending)\n    FROM tally t\n    JOIN closed c USING (batch_id)\n    RETURNING 1\n)\nSELECT $1::bigint AS notification_id,\n       (SELECT status FROM updated) AS status,\n       (SELECT coalesce(sum(offers), 0) FROM marked) AS matches_marked,\n       EXISTS (SELECT 1 FROM closed) AS batch_finished,\n       (SELECT count(*) FROM metrics) AS metrics_written;\n",
+        "options": {
+          "queryReplacement": "={{ [ $json.notification_id, $json.outcome, $json.ses_message_id, $json.error, $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000015",
+      "name": "Pace sends",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2464,
+        -160
+      ],
+      "parameters": {
+        "amount": "={{ $('Check email settings').first().json.pause_seconds }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000020",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1792,
+        240
+      ],
+      "executeOnce": true,
+      "parameters": {},
+      "notes": "Every path ends here, so Workflow B gets C's result on its first output and goes on to the next batch.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Called by Workflow B": {
+      "main": [
+        [
+          {
+            "node": "Plan notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Plan notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check email settings": {
+      "main": [
+        [
+          {
+            "node": "Render emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan notifications": {
+      "main": [
+        [
+          {
+            "node": "Check email settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render emails": {
+      "main": [
+        [
+          {
+            "node": "Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send?": {
+      "main": [
+        [
+          {
+            "node": "Check recipients",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check recipients": {
+      "main": [
+        [
+          {
+            "node": "Loop over emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over emails": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send email (AWS SES)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send email (AWS SES)": {
+      "main": [
+        [
+          {
+            "node": "Read SES result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read SES result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read SES result": {
+      "main": [
+        [
+          {
+            "node": "Record result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record result": {
+      "main": [
+        [
+          {
+            "node": "Pace sends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pace sends": {
+      "main": [
+        [
+          {
+            "node": "Loop over emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  },
+  "active": false,
+  "pinData": {}
+}

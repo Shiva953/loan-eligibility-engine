@@ -1,0 +1,78 @@
+{
+  "products": "real",
+  "profile": "wide",
+  "users": 10000,
+  "active_products": 24,
+  "banding": "threshold",
+  "k": 25,
+  "funnel": {
+    "s0_naive_llm_calls": 240000,
+    "s2_pairs_after_hard_filter": 32238,
+    "pairs_with_fuzzy_criteria": 693,
+    "s3_pending_questions": 693,
+    "s3_cohorts": 1,
+    "s4_uncached_cohorts": 1,
+    "s4_uncompiled_criteria": 1,
+    "s5_llm_calls": 2,
+    "rerun_llm_calls": 0,
+    "warm_llm_calls": 2,
+    "warm_cohorts": 1,
+    "warm_cohorts_no_batch_needed": 0,
+    "match_time_calls_after_warming": 0
+  },
+  "statuses": {
+    "matched": 31545,
+    "llm_matched": 693,
+    "llm_rejected": 0,
+    "pending_llm": 0
+  },
+  "rows_written": 32238,
+  "rerun_rows_written": 0,
+  "cohorts_by_mode": {
+    "threshold": 1,
+    "coarse": 1,
+    "fine": 1,
+    "exact": 1
+  },
+  "max_items_in_a_node": 2,
+  "timings_ms": {
+    "load_users": 129,
+    "s3_s4_uncached_cohorts": 7,
+    "write_matches": 85,
+    "rerun_uncached_cohorts": 7,
+    "rerun_write_matches": 62,
+    "reference_python": 34
+  },
+  "recall": 1.0,
+  "precision": 1.0,
+  "s2_variants": {
+    "d0_js_naive": {
+      "variant": "d0",
+      "users": 10000,
+      "products": 24,
+      "pairs": 32238,
+      "ms": 5.118292,
+      "heap_mb": 5.067207336425781,
+      "exact": true
+    },
+    "d4_js_bitmask": {
+      "variant": "d4",
+      "users": 10000,
+      "products": 24,
+      "pairs": 32238,
+      "ms": 2.724709,
+      "heap_mb": 3.0040206909179688,
+      "exact": true
+    },
+    "d1_sql_join": {
+      "ms": 18.014707835391164,
+      "pairs": 32238,
+      "exact": true
+    },
+    "d2_sql_cells": {
+      "ms": 31.15816693753004,
+      "pairs": 32238,
+      "exact": true
+    }
+  }
+}

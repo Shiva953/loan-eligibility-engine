@@ -1,0 +1,63 @@
+[project]
+name = "loan-eligibility-engine"
+version = "0.1.0"
+description = "AWS serverless ingestion plus self-hosted n8n workflows that match users to personal-loan products."
+readme = "docs/PLAN.md"
+requires-python = ">=3.14"
+dependencies = [
+    "psycopg[binary]==3.3.6",
+]
+
+[dependency-groups]
+dev = [
+    "boto3==1.43.114",
+    "moto[s3,ssm]==5.2.4",
+    "mypy==2.4.0",
+    "pytest==9.1.1",
+    "pyyaml==6.0.3",
+    "ruff==0.17.1",
+]
+
+[tool.uv]
+# Scripts, Lambda handlers and tests are run in place, never installed as a package.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+extend-exclude = ["n8n/workflows", "bench/results"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF", "D", "ANN", "PT"]
+ignore = [
+    "D105",  # magic methods document themselves
+    "D107",  # __init__ is documented on the class
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["scripts", "common", "ingest", "notify", "presign", "status"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D101", "D102", "D103", "ANN"]
+# Decodes arbitrary n8n execution JSON, whose shape is n8n's, not ours: Any is the honest type.
+"scripts/n8n_execution.py" = ["ANN401"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+explicit_package_bases = true
+files = ["scripts", "services", "tests", "bench"]
+mypy_path = "services"
+
+# boto3, moto and PyYAML ship no type information; the code uses only a few calls on them.
+[[tool.mypy.overrides]]
+module = ["boto3", "boto3.*", "botocore", "botocore.*", "moto", "moto.*", "yaml", "yaml.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "services"]
+addopts = "-ra --strict-markers"

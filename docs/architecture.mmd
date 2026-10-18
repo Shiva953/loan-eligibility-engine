@@ -1,0 +1,56 @@
+flowchart TB
+  user(["Browser · upload page (Next.js)"]):::ext
+
+  subgraph AWS["AWS (Sydney)"]
+    presign["presign λ · Function URL<br/>one-time POST policy"]
+    s3[("S3 bucket<br/>uploads/ · rejects/")]
+    notify["notify λ<br/>signs an HS256 JWT"]
+    ssm[["SSM SecureString<br/>tunnel URL · webhook secret"]]
+    dlq[["SQS dead-letter queue"]]
+    subgraph VPC["VPC · no NAT"]
+      ingest["ingest λ<br/>COPY + one SQL statement"]
+      status["status λ · Function URL"]
+      rds[("RDS Postgres 17 · db.t4g.micro<br/>users · loan_products · user_matches · notifications")]
+    end
+    ses["SES · sandbox"]
+  end
+
+  subgraph COMPOSE["Docker Compose · self-hosted"]
+    cf["cloudflared · quick tunnel"]
+    gw["webhook-gw (nginx)<br/>only POST /webhook/loan-match"]
+    subgraph N8N["n8n 2.43.6 + task runner"]
+      B["B · user-loan matching<br/>webhook · sweeper · manual"]
+      C["C · notification"]
+      A["A · product discovery<br/>daily 06:00"]
+      W["Warm match cache"]
+      G["LLM gateway"]
+    end
+  end
+
+  subgraph EXT["Outside services"]
+    sites(["Lender pages<br/>BankBazaar · HDFC · Kotak"]):::ext
+    gemini(["Gemini API"]):::ext
+    inbox(["Test inboxes<br/>+1 / +2 aliases"]):::ext
+  end
+
+  user -- "1 · presign" --> presign
+  user -- "2 · POST file, gzip" --> s3
+  user -. "5 · poll status" .-> status
+  s3 -- "3 · ObjectCreated" --> ingest
+  ingest -- "IAM token, TLS" --> rds
+  status --> rds
+  ingest -- "onSuccess" --> notify
+  ingest -. "onFailure" .-> dlq
+  notify --> ssm
+  notify -- "4 · signed webhook" --> cf --> gw --> B
+  B -- "6 · then" --> C
+  N8N == "set-based SQL as n8n_app, verified TLS" ==> rds
+  C -- "SendEmail, ≤ 2 per run" --> ses --> inbox
+  A --> W
+  A --> G
+  W --> G
+  B --> G
+  A -- "robots.txt, fetch" --> sites
+  G --> gemini
+
+  classDef ext fill:#f6f8fd,stroke:#c9d2ec,color:#0b1533

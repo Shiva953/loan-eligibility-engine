@@ -1,0 +1,1271 @@
+{
+  "name": "A · Loan product discovery",
+  "nodes": [
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000101",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -320
+      ],
+      "parameters": {
+        "width": 1312,
+        "height": 256,
+        "content": "## A · Loan product discovery (S1 crawl-time compile + S6 confidence guard)\nDaily at 06:00, or run manually. For each source in `crawl_sources`, one at a time: check robots.txt → fetch pages → clean to structured text → SHA-256 → **unchanged? skip the LLM**. Otherwise extract through the LLM gateway → validate and compile rules in code → upsert with a criteria diff → close the crawl run.\n`crawl_mode=fixtures` (default) reads saved pages from the `fixtures` container. `live` fetches the real sites with our User-Agent and a pause between requests.\nEvery failure path closes that source's run as `error`, so one bad source never stops the others.\nLast, **Warm match cache** judges every cohort the active products can produce, so Workflow B finds them cached and makes no LLM call at match time.\n**A second run skips the LLM by design** (pages unchanged, cohorts cached). `make demo-reset` forgets one page's hash and the warm cache, so the next run takes every branch."
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000102",
+      "name": "Per-source error handling",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1504,
+        672
+      ],
+      "parameters": {
+        "width": 2560,
+        "height": 160,
+        "color": 3,
+        "content": "### Failure paths\nrobots.txt disallowed or unreachable · a page not 200 · the LLM failed or the budget is spent · validation threw · upsert failed. Each one becomes an item with `run_status` and `error`, and goes to **Finish crawl run**, which records it in `crawl_runs`. Then the loop moves on to the next source."
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000001",
+      "name": "Daily at 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        208
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000002",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        400
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000003",
+      "name": "Load app_config",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/common/load_config.sql",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000004",
+      "name": "Load sources",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        448,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/crawl/load_sources.sql",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000005",
+      "name": "Loop over sources",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        672,
+        304
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000006",
+      "name": "Deactivate stale products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "executeOnce": true,
+      "position": [
+        896,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/crawl/deactivate_stale.sql",
+        "options": {
+          "queryReplacement": "={{ [ Number($('Load app_config').first().json.config.product_stale_days) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000007",
+      "name": "Crawl summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "executeOnce": true,
+      "position": [
+        1120,
+        0
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/crawl/summary.sql",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000201",
+      "name": "Warm match cache",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1344,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "@@workflow:warm_match_cache",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000008",
+      "name": "Start crawl run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        896,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/crawl/start_run.sql",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id, $json.source_id, $('Load app_config').first().json.config.crawl_mode ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000009",
+      "name": "Fetch robots.txt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        304
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "url": "={{ $('Load app_config').first().json.config.crawl_mode === 'fixtures' ? 'http://fixtures/' + $('Loop over sources').first().json.slug + '/robots.txt' : $('Loop over sources').first().json.robots_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $('Load app_config').first().json.config.crawl_user_agent }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000010",
+      "name": "Plan page fetches",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        304
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/plan_fetches.js"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000011",
+      "name": "Allowed by robots?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1568,
+        304
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c1",
+              "leftValue": "={{ $json.robots_blocked }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000012",
+      "name": "Fetch pages",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1792,
+        208
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "url": "={{ $json.fetch_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "={{ $json.user_agent }}"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html,*/*;q=0.8"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": "={{ $('Load app_config').first().json.config.crawl_mode === 'live' ? Number($('Load app_config').first().json.config.crawl_delay_seconds) * 1000 : 0 }}"
+            }
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "text"
+            }
+          },
+          "timeout": 30000
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000013",
+      "name": "Collect pages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        208
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/collect_pages.js"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000014",
+      "name": "Pages fetched?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2240,
+        208
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c2",
+              "leftValue": "={{ $json.fetch_ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000015",
+      "name": "Clean page text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2464,
+        112
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/clean_html.js"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000016",
+      "name": "Hash page text",
+      "type": "n8n-nodes-base.crypto",
+      "typeVersion": 2,
+      "position": [
+        2688,
+        112
+      ],
+      "parameters": {
+        "action": "hash",
+        "type": "SHA256",
+        "value": "={{ $json.text }}",
+        "dataPropertyName": "content_hash",
+        "encoding": "hex"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000017",
+      "name": "Page changed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2912,
+        112
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c3",
+              "leftValue": "={{ $json.content_hash !== $('Loop over sources').first().json.last_content_hash }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000018",
+      "name": "Mark unchanged",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3136,
+        304
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a1",
+              "name": "run_status",
+              "value": "unchanged",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a2",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000019",
+      "name": "Build extraction request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3136,
+        16
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/build_extraction.js"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000020",
+      "name": "Extract with LLM",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        3360,
+        16
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "@@workflow:llm_gateway",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000021",
+      "name": "Extraction ok?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3584,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c4",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000022",
+      "name": "Mark extraction failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3808,
+        304
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a3",
+              "name": "run_status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a4",
+              "name": "error",
+              "value": "={{ 'extraction failed: ' + ($json.message ?? $json.error?.message ?? $json.error ?? 'unknown') }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a5",
+              "name": "content_hash",
+              "value": "={{ $('Hash page text').first().json.content_hash }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a6",
+              "name": "llm_calls",
+              "value": "={{ $json.calls ?? 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a7",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000023",
+      "name": "Validate products",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3808,
+        -96
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "jsCode": "@@include:n8n/code/validate_products.js"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000024",
+      "name": "Upsert products",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4032,
+        -96
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/crawl/upsert_products.sql",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.products), $('Loop over sources').first().json.source_id, $('Start crawl run').first().json.run_id, $json.content_hash ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000025",
+      "name": "Mark changed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4256,
+        -96
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a8",
+              "name": "run_status",
+              "value": "changed",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000a9",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000aa",
+              "name": "content_hash",
+              "value": "={{ $('Validate products').first().json.content_hash }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ab",
+              "name": "products_found",
+              "value": "={{ $('Validate products').first().json.products_found }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ac",
+              "name": "llm_calls",
+              "value": "={{ $('Validate products').first().json.llm_calls }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ad",
+              "name": "tokens_in",
+              "value": "={{ $('Validate products').first().json.tokens_in }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000ae",
+              "name": "tokens_out",
+              "value": "={{ $('Validate products').first().json.tokens_out }}",
+              "type": "number"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000026",
+      "name": "Mark processing failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        4256,
+        304
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000af",
+              "name": "run_status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b0",
+              "name": "error",
+              "value": "={{ 'validation or upsert failed: ' + ($json.message ?? $json.error?.message ?? $json.error ?? 'unknown') }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b1",
+              "name": "content_hash",
+              "value": "={{ $('Hash page text').item.json.content_hash }}",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b2",
+              "name": "llm_calls",
+              "value": "={{ $('Extract with LLM').item.json.calls ?? 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b3",
+              "name": "http_status",
+              "value": 200,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000027",
+      "name": "Finish crawl run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        4480,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/crawl/finish_run.sql",
+        "options": {
+          "queryReplacement": "={{ [ $('Start crawl run').first().json.run_id, $json.run_status, $json.http_status ?? null, $json.content_hash ?? null, $json.products_found ?? null, $json.llm_calls ?? 0, $json.tokens_in ?? 0, $json.tokens_out ?? 0, $json.error ?? null ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000028",
+      "name": "Live mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4704,
+        304
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000c5",
+              "leftValue": "={{ $('Load app_config').first().json.config.crawl_mode === 'live' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000029",
+      "name": "Polite pause",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        4928,
+        208
+      ],
+      "webhookId": "0a0a0a0a-0000-4000-8000-0000000000d1",
+      "parameters": {
+        "amount": "={{ Number($('Load app_config').first().json.config.crawl_delay_seconds) }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "0a0a0a0a-0000-4000-8000-000000000030",
+      "name": "Mark early step failed",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2464,
+        496
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b4",
+              "name": "run_status",
+              "value": "error",
+              "type": "string"
+            },
+            {
+              "id": "0a0a0a0a-0000-4000-8000-0000000000b5",
+              "name": "error",
+              "value": "={{ 'step failed before extraction: ' + ($json.message ?? $json.error?.message ?? $json.error ?? 'unknown') }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Crawl summary": {
+      "main": [
+        [
+          {
+            "node": "Warm match cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Daily at 06:00": {
+      "main": [
+        [
+          {
+            "node": "Load app_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Load app_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load app_config": {
+      "main": [
+        [
+          {
+            "node": "Load sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load sources": {
+      "main": [
+        [
+          {
+            "node": "Loop over sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over sources": {
+      "main": [
+        [
+          {
+            "node": "Deactivate stale products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Start crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Deactivate stale products": {
+      "main": [
+        [
+          {
+            "node": "Crawl summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Start crawl run": {
+      "main": [
+        [
+          {
+            "node": "Fetch robots.txt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch robots.txt": {
+      "main": [
+        [
+          {
+            "node": "Plan page fetches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan page fetches": {
+      "main": [
+        [
+          {
+            "node": "Allowed by robots?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Allowed by robots?": {
+      "main": [
+        [
+          {
+            "node": "Fetch pages",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch pages": {
+      "main": [
+        [
+          {
+            "node": "Collect pages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect pages": {
+      "main": [
+        [
+          {
+            "node": "Pages fetched?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pages fetched?": {
+      "main": [
+        [
+          {
+            "node": "Clean page text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean page text": {
+      "main": [
+        [
+          {
+            "node": "Hash page text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hash page text": {
+      "main": [
+        [
+          {
+            "node": "Page changed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Page changed?": {
+      "main": [
+        [
+          {
+            "node": "Build extraction request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark unchanged",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark unchanged": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build extraction request": {
+      "main": [
+        [
+          {
+            "node": "Extract with LLM",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark early step failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract with LLM": {
+      "main": [
+        [
+          {
+            "node": "Extraction ok?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark extraction failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraction ok?": {
+      "main": [
+        [
+          {
+            "node": "Validate products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark extraction failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark extraction failed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate products": {
+      "main": [
+        [
+          {
+            "node": "Upsert products",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark processing failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert products": {
+      "main": [
+        [
+          {
+            "node": "Mark changed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark processing failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark changed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finish crawl run": {
+      "main": [
+        [
+          {
+            "node": "Live mode?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live mode?": {
+      "main": [
+        [
+          {
+            "node": "Polite pause",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop over sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Polite pause": {
+      "main": [
+        [
+          {
+            "node": "Loop over sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark processing failed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark early step failed": {
+      "main": [
+        [
+          {
+            "node": "Finish crawl run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  }
+}

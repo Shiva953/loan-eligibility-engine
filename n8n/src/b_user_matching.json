@@ -1,0 +1,732 @@
+{
+  "name": "B · User-loan matching",
+  "nodes": [
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000101",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -448
+      ],
+      "parameters": {
+        "width": 1408,
+        "height": 288,
+        "content": "## B · User-loan matching (S2 hard filter · S3 cohorts · S4 cache · S5 batched LLM + rule veto)\nTriggered by the signed webhook after ingestion (JWT, 202 at once), by the sweeper for batches that stalled, or by **Run manually** for every batch waiting. One batch at a time, in **two database round trips** when everything is cached:\n1. **Claim batch** (one statement): claim it, so a replay or the sweeper can't match it twice; read `app_config`; find the uncached cohorts. Every pending (pair, fuzzy criterion) collapses to (criterion, banded facts), and cached verdicts are reused. Criteria without a compiled rule are listed too. n8n only ever holds cohorts and criteria, never users × products.\n2. Only if something is uncached: **K cohorts per request** plus one **compile** request through the LLM gateway in one call (it sends them `llm_concurrency` at a time), then **cache** the verdicts and rules.\n3. **Write matches** (one statement): one set-based INSERT of the hard filter joined with the cohort verdicts, then mark the batch matched. A compiled rule can veto an uncertain verdict, never vouch for one. Metrics per stage go to `pipeline_metrics` in the same statements.\n4. Call **Workflow C**.\n\n**To run it from this canvas:** open the chevron on **Execute workflow**, pick **Run manually**, and click. It matches every batch waiting in `ingested`; with none waiting it ends at **Nothing waiting**. `make demo-reset ARGS=\"--cold-batch 1000\"` loads a waiting batch whose cohorts aren't cached, so the run takes every branch, LLM included. Webhook runs from the upload page are under **Executions**."
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000102",
+      "name": "LLM only for what's left",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1568,
+        -592
+      ],
+      "parameters": {
+        "width": 960,
+        "height": 176,
+        "color": 4,
+        "content": "### Match-time LLM calls = ⌈uncached cohorts ÷ K⌉ + ⌈uncompiled criteria ÷ 25⌉\nNormally **0**: Workflow A's warm step judges every cohort the products can produce right after each crawl, so batches find them cached. Otherwise flat in the number of users: 10k or 100k users give the same cohorts. 0 on a rerun (everything is cached). Skipped entirely when no product has a fuzzy criterion, or when `match_llm_enabled` is false."
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000022",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        400
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000001",
+      "name": "Batch ingested (signed webhook)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "0b0b0b0b-0000-4000-8000-0000000000aa",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "loan-match",
+        "authentication": "jwtAuth",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": {
+            "values": {
+              "responseCode": "customCode",
+              "customCode": 202
+            }
+          }
+        }
+      },
+      "credentials": {
+        "jwtAuth": "@@credential:webhook_jwt"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000004",
+      "name": "Read token claims",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/webhook_claims.js"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000002",
+      "name": "Sweeper every 10 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        208
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000005",
+      "name": "Find waiting batches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/match/stalled_batches.sql",
+        "options": {
+          "queryReplacement": "={{ [ $('Run manually').isExecuted ? '0' : '', $('Run manually').isExecuted ? 'manual' : 'sweeper' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      },
+      "alwaysOutputData": true
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000006",
+      "name": "Loop over batches",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        672,
+        96
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000008",
+      "name": "Claim batch",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        896,
+        96
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/match/uncached_cohorts.sql",
+        "options": {
+          "queryReplacement": "={{ [ $('Loop over batches').first().json.batch_id, '', '', $execution.id, '', 'true' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000009",
+      "name": "Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        96
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0b0b0b0b-0000-4000-8000-0000000000c1",
+              "leftValue": "={{ $json.claimed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000011",
+      "name": "LLM needed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1344,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0b0b0b0b-0000-4000-8000-0000000000c2",
+              "leftValue": "={{ $json.cohorts.length > 0 || $json.criteria.length > 0 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000012",
+      "name": "Build cohort requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        -208
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "jsCode": "@@include:n8n/code/build_cohort_requests.js"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000014",
+      "name": "Judge cohorts (LLM gateway)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1792,
+        -208
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "@@workflow:llm_gateway",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000015",
+      "name": "Attach cohort refs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        -208
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/attach_cohort_refs.js"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000016",
+      "name": "Collect verdicts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2240,
+        -208
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "jsCode": "@@include:n8n/code/parse_cohort_verdicts.js"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000017",
+      "name": "Store verdicts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2464,
+        -208
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/match/store_decisions.sql",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.decisions), $('Loop over batches').first().json.batch_id, $execution.id, JSON.stringify({ calls: $json.calls, tokens_in: $json.tokens_in, tokens_out: $json.tokens_out, requests: $json.requests, failed_requests: $json.failed_requests, unanswered: $json.unanswered }), JSON.stringify($json.rules ?? []) ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000018",
+      "name": "Write matches",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2464,
+        0
+      ],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000,
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/match/write_matches.sql",
+        "options": {
+          "queryReplacement": "={{ [ $('Loop over batches').first().json.batch_id, $('Claim batch').first().json.cohort_bands, $('Claim batch').first().json.match_llm_enabled, $execution.id, $('Claim batch').first().json.match_rules_enabled ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000020",
+      "name": "Notify users (Workflow C)",
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        2688,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "source": "database",
+        "workflowId": {
+          "__rl": true,
+          "value": "@@workflow:c_notification",
+          "mode": "id"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "mode": "once",
+        "options": {
+          "waitForSubWorkflow": true
+        }
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000021",
+      "name": "Mark batch failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2688,
+        400
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/match/fail_batch.sql",
+        "options": {
+          "queryReplacement": "={{ [ $('Loop over batches').first().json.batch_id, String($json.message ?? $json.error?.message ?? $json.error ?? 'unknown error') ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000003",
+      "name": "Next batch",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2912,
+        208
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000023",
+      "name": "Anything waiting?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        448,
+        304
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0b0b0b0b-0000-4000-8000-0000000000c3",
+              "leftValue": "={{ !!$json.batch_id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0b0b0b0b-0000-4000-8000-000000000024",
+      "name": "Nothing waiting",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        672,
+        400
+      ],
+      "parameters": {},
+      "notes": "No batch is waiting in 'ingested'. Load one with `make load-batch` (later: the upload page), then run again.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Batch ingested (signed webhook)": {
+      "main": [
+        [
+          {
+            "node": "Read token claims",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read token claims": {
+      "main": [
+        [
+          {
+            "node": "Loop over batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sweeper every 10 min": {
+      "main": [
+        [
+          {
+            "node": "Find waiting batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over batches": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Claim batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim batch": {
+      "main": [
+        [
+          {
+            "node": "Claimed?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark batch failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claimed?": {
+      "main": [
+        [
+          {
+            "node": "LLM needed?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Next batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM needed?": {
+      "main": [
+        [
+          {
+            "node": "Build cohort requests",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Write matches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build cohort requests": {
+      "main": [
+        [
+          {
+            "node": "Judge cohorts (LLM gateway)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark batch failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Judge cohorts (LLM gateway)": {
+      "main": [
+        [
+          {
+            "node": "Attach cohort refs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach cohort refs": {
+      "main": [
+        [
+          {
+            "node": "Collect verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect verdicts": {
+      "main": [
+        [
+          {
+            "node": "Store verdicts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark batch failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store verdicts": {
+      "main": [
+        [
+          {
+            "node": "Write matches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark batch failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write matches": {
+      "main": [
+        [
+          {
+            "node": "Notify users (Workflow C)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark batch failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify users (Workflow C)": {
+      "main": [
+        [
+          {
+            "node": "Next batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark batch failed": {
+      "main": [
+        [
+          {
+            "node": "Next batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Next batch": {
+      "main": [
+        [
+          {
+            "node": "Loop over batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find waiting batches": {
+      "main": [
+        [
+          {
+            "node": "Anything waiting?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Find waiting batches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Anything waiting?": {
+      "main": [
+        [
+          {
+            "node": "Loop over batches",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing waiting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  }
+}

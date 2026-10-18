@@ -1,0 +1,20 @@
+{
+  "entries": [
+    {
+      "file": "robots.txt",
+      "url": "https://www.herofincorp.com/robots.txt",
+      "status": 200,
+      "bytes": 4065,
+      "sha256": "4c8ee46086cf5155b1e15b4295c235a90080eebfb18e258f207eb8714e0459a0",
+      "fetched_at": "2026-10-16T10:11:12+00:00"
+    },
+    {
+      "file": "personal-loan-eligibility.html",
+      "url": "https://www.herofincorp.com/personal-loan-eligibility",
+      "status": 200,
+      "bytes": 304787,
+      "sha256": "6dea3b99059164410f5a98ccf257ba17e2bef5b84d056e094f8bb3d76d2716b6",
+      "fetched_at": "2026-10-16T10:11:17+00:00"
+    }
+  ]
+}

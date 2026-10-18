@@ -1,0 +1,491 @@
+# The AWS side of the Loan Eligibility Engine (docs/PLAN.md phase 3, docs/DECISIONS.md AD1-AD10).
+#
+#   browser --POST--> presign (Function URL) --> {url, fields}
+#   browser --POST multipart--> S3 uploads/<uuid>.csv --event--> ingest (in the VPC) --> RDS
+#   ingest --onSuccess--> notify (outside the VPC) --> SSM --> signed webhook --> tunnel --> n8n
+#   ingest --onFailure--> SQS dead-letter queue
+#   browser --GET--> status (Function URL, in the VPC) --> RDS
+#
+# Works with Serverless Framework v4 and with osls (the v3 fork): nothing here is v4-only.
+# Resources whose syntax the two might compile differently (the bucket and its event, IAM, the
+# URL permissions) are plain CloudFormation. ARNs are built with Fn::Join, never !Sub, because
+# !Sub's ${AWS::...} collides with the framework's own ${...} variables.
+#
+# Cost (AWS Free plan; CLAUDE.md): no NAT gateway, no interface endpoints, no RDS Proxy, no
+# Multi-AZ, no load balancer, no EC2, no Secrets Manager, no provisioned concurrency. The S3
+# endpoint is a free gateway endpoint. The one paid item is RDS's public IPv4 (about $0.005/h,
+# AD8), and RDS is stopped between sessions (make rds-stop). tests/test_infra.py checks this.
+#
+# Before a deploy: make lambda-build, and make aws-params (the SecureStrings this file reads).
+
+service: loan-engine
+
+provider:
+  name: aws
+  region: ${env:AWS_REGION}
+  stage: ${opt:stage, 'dev'}  # make deploy passes --stage $(STAGE)
+  runtime: python3.14
+  architecture: arm64
+  logRetentionInDays: 7
+  versionFunctions: false
+  deploymentMethod: direct
+  tags:
+    project: loan-engine
+
+package:
+  artifact: ../build/lambda/app.zip
+
+layers:
+  deps:
+    name: ${self:service}-${sls:stage}-deps
+    description: psycopg 3.3.6 (binary, cp314 aarch64), for ingest and status
+    package:
+      artifact: ../build/lambda/deps.zip
+    compatibleRuntimes:
+      - python3.14
+    compatibleArchitectures:
+      - arm64
+
+custom:
+  ssmPrefix: ${env:SSM_PREFIX}
+  bucketName: ${self:service}-${sls:stage}-uploads-
+  dbUser: lambda_app
+  uiOrigins:
+    - http://localhost:8090
+    - http://localhost:3000
+    - ${env:UI_PUBLIC_ORIGIN, 'http://127.0.0.1:3000'}
+  dbEnvironment:
+    DB_HOST: !GetAtt Database.Endpoint.Address
+    DB_PORT: '5432'
+    DB_NAME: ${env:RDS_DB_NAME, 'loans'}
+    DB_USER: ${self:custom.dbUser}
+    DB_AUTH: iam
+    DB_SSLMODE: verify-full
+    DB_SSLROOTCERT: /var/task/certs/rds-global-bundle.pem
+
+functions:
+  presign:
+    handler: presign/handler.handler
+    description: A presigned POST for one new upload key (text/csv, at most 50 MB, 5 minutes)
+    memorySize: 128
+    timeout: 5
+    role: PresignRole
+    url:
+      cors:
+        allowedOrigins: ${self:custom.uiOrigins}
+        allowedMethods:
+          - POST
+        allowedHeaders:
+          - content-type
+        maxAge: 86400
+    environment:
+      UPLOAD_BUCKET: !Join ['', ['${self:custom.bucketName}', !Ref 'AWS::AccountId']]
+      UPLOAD_MAX_BYTES: ${env:UPLOAD_MAX_BYTES, '52428800'}
+      PRESIGN_EXPIRES_SECONDS: ${env:PRESIGN_EXPIRES_SECONDS, '300'}
+
+  ingest:
+    handler: ingest/handler.handler
+    description: Validate and load an uploaded CSV into RDS (one transaction, set-based SQL)
+    # CPU scales with memory; at 1 GB a 100k-row file is about 2 s, mostly in Postgres.
+    memorySize: 1024
+    # Up to 2 minutes for a cold IAM login (AD41), then at least 3 for the file itself.
+    timeout: 300
+    role: IngestRole
+    layers:
+      - !Ref DepsLambdaLayer
+    vpc:
+      securityGroupIds:
+        - !Ref LambdaSecurityGroup
+      subnetIds:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+    maximumRetryAttempts: 2
+    maximumEventAge: 3600
+    destinations:
+      onSuccess: notify
+      onFailure:
+        type: sqs
+        arn: !GetAtt IngestFailures.Arn
+    environment: ${self:custom.dbEnvironment}
+
+  notify:
+    handler: notify/handler.handler
+    description: Send the signed batch-ready webhook to n8n through the tunnel
+    # CPU scales with memory: at 128 MB a cold start spent ~5 s importing boto3 (V44).
+    memorySize: 512
+    timeout: 15
+    role: NotifyRole
+    environment:
+      TUNNEL_URL_PARAM: ${self:custom.ssmPrefix}/tunnel-url
+      WEBHOOK_SECRET_PARAM: ${self:custom.ssmPrefix}/webhook-secret
+
+  status:
+    handler: status/handler.handler
+    description: A batch's progress for the upload page, by upload key
+    memorySize: 256
+    timeout: 60  # a cold IAM login may take tens of seconds; the page keeps polling (AD41)
+    role: StatusRole
+    layers:
+      - !Ref DepsLambdaLayer
+    vpc:
+      securityGroupIds:
+        - !Ref LambdaSecurityGroup
+      subnetIds:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+    url:
+      cors:
+        allowedOrigins: ${self:custom.uiOrigins}
+        allowedMethods:
+          - GET
+        maxAge: 86400
+    environment: ${self:custom.dbEnvironment}
+
+resources:
+  Resources:
+    # --- Network (AD9): two public subnets, an internet gateway for RDS, a free S3 endpoint ---
+    Vpc:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.20.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true  # the RDS endpoint resolves to its private IP inside the VPC
+        Tags:
+          - {Key: Name, Value: '${self:service}-${sls:stage}'}
+    PublicSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref Vpc
+        CidrBlock: 10.20.0.0/24
+        AvailabilityZone: !Select [0, !GetAZs '']
+    PublicSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId: !Ref Vpc
+        CidrBlock: 10.20.1.0/24
+        AvailabilityZone: !Select [1, !GetAZs '']
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+    InternetGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId: !Ref Vpc
+        InternetGatewayId: !Ref InternetGateway
+    PublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId: !Ref Vpc
+    DefaultRoute:
+      Type: AWS::EC2::Route
+      DependsOn: InternetGatewayAttachment
+      Properties:
+        RouteTableId: !Ref PublicRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId: !Ref InternetGateway
+    PublicSubnetARoutes:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PublicSubnetA
+        RouteTableId: !Ref PublicRouteTable
+    PublicSubnetBRoutes:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId: !Ref PublicSubnetB
+        RouteTableId: !Ref PublicRouteTable
+    # Lambdas in the VPC have no public IP, so this endpoint is their only way to S3.
+    S3GatewayEndpoint:
+      Type: AWS::EC2::VPCEndpoint
+      Properties:
+        VpcEndpointType: Gateway
+        VpcId: !Ref Vpc
+        ServiceName: !Join ['', ['com.amazonaws.', !Ref 'AWS::Region', '.s3']]
+        RouteTableIds:
+          - !Ref PublicRouteTable
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: '*'
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Join ['', ['arn:aws:s3:::${self:custom.bucketName}', !Ref 'AWS::AccountId', '/*']]
+    LambdaSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: ingest and status Lambdas (no inbound)
+        VpcId: !Ref Vpc
+        SecurityGroupEgress:
+          - {IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0, Description: S3 through the gateway endpoint}
+    LambdaToDatabase:
+      Type: AWS::EC2::SecurityGroupEgress
+      Properties:
+        GroupId: !Ref LambdaSecurityGroup
+        IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+        Description: Postgres
+    DatabaseSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: RDS Postgres from the Lambdas and the owner IP (n8n, migrations)
+        VpcId: !Ref Vpc
+        SecurityGroupIngress:
+          - {IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: '${env:MY_IP_CIDR}', Description: owner}
+    DatabaseFromLambda:
+      Type: AWS::EC2::SecurityGroupIngress
+      Properties:
+        GroupId: !Ref DatabaseSecurityGroup
+        IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        SourceSecurityGroupId: !Ref LambdaSecurityGroup
+        Description: ingest and status Lambdas
+
+    # --- Database: db.t4g.micro, single-AZ, 20 GB gp3, 1-day backups, TLS only, IAM auth ---
+    DatabaseSubnets:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: ${self:service}-${sls:stage}
+        SubnetIds:
+          - !Ref PublicSubnetA
+          - !Ref PublicSubnetB
+    DatabaseParameters:
+      Type: AWS::RDS::DBParameterGroup
+      Properties:
+        Description: ${self:service}-${sls:stage} (postgres17)
+        Family: postgres17
+        Parameters:
+          rds.force_ssl: '1'
+          wal_compression: lz4  # as the local app-db (AD28); RDS's default is zstd
+          rds.log_retention_period: '10080'  # 7 days of logs, on the instance's own storage
+    Database:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete  # make destroy leaves nothing billed; ask the owner first
+      UpdateReplacePolicy: Snapshot
+      Properties:
+        DBInstanceIdentifier: ${self:service}-${sls:stage}
+        Engine: postgres
+        EngineVersion: '17.11'  # the local app-db's version (V16); RDS's default is now 18.3
+        AllowMajorVersionUpgrade: false
+        AutoMinorVersionUpgrade: false
+        DBInstanceClass: db.t4g.micro
+        MultiAZ: false
+        AllocatedStorage: '20'
+        StorageType: gp3
+        StorageEncrypted: true
+        BackupRetentionPeriod: 1
+        DeleteAutomatedBackups: true
+        DeletionProtection: false
+        EnablePerformanceInsights: false
+        MonitoringInterval: 0
+        PubliclyAccessible: true
+        EnableIAMDatabaseAuthentication: true
+        CACertificateIdentifier: rds-ca-rsa2048-g1
+        DBName: ${env:RDS_DB_NAME, 'loans'}
+        MasterUsername: ${env:RDS_MASTER_USER, 'loans_admin'}
+        MasterUserPassword: '{{resolve:ssm-secure:${self:custom.ssmPrefix}/rds-master-password}}'
+        DBSubnetGroupName: !Ref DatabaseSubnets
+        DBParameterGroupName: !Ref DatabaseParameters
+        VPCSecurityGroups:
+          - !Ref DatabaseSecurityGroup
+
+    # --- Upload bucket: private, CORS for the page's POST, 7-day expiry, event to ingest ---
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      DependsOn: IngestFromS3
+      Properties:
+        BucketName: !Join ['', ['${self:custom.bucketName}', !Ref 'AWS::AccountId']]
+        OwnershipControls:
+          Rules:
+            - ObjectOwnership: BucketOwnerEnforced
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedMethods: [POST]
+              AllowedOrigins: ${self:custom.uiOrigins}
+              AllowedHeaders: ['*']
+              MaxAge: 86400
+        LifecycleConfiguration:
+          Rules:
+            - {Id: expire-uploads, Prefix: uploads/, Status: Enabled, ExpirationInDays: 7}
+            - {Id: expire-rejects, Prefix: rejects/, Status: Enabled, ExpirationInDays: 7}
+            - Id: abort-incomplete
+              Status: Enabled
+              AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+        NotificationConfiguration:
+          LambdaConfigurations:
+            - Event: s3:ObjectCreated:*
+              Function: !GetAtt IngestLambdaFunction.Arn
+              Filter:
+                S3Key:
+                  Rules:
+                    - {Name: prefix, Value: uploads/}
+                    - {Name: suffix, Value: .csv}
+    IngestFromS3:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt IngestLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: s3.amazonaws.com
+        SourceAccount: !Ref 'AWS::AccountId'
+        SourceArn: !Join ['', ['arn:aws:s3:::${self:custom.bucketName}', !Ref 'AWS::AccountId']]
+    IngestFailures:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-${sls:stage}-ingest-failures
+        MessageRetentionPeriod: 1209600
+        SqsManagedSseEnabled: true
+
+    # --- Public Function URLs: since October 2025 a URL needs both permissions. Declared here
+    # as well, so the result doesn't depend on which framework version compiled the url block.
+    PresignUrlInvoke:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt PresignLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: '*'
+        InvokedViaFunctionUrl: true
+    StatusUrlInvoke:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt StatusLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: '*'
+        InvokedViaFunctionUrl: true
+
+    # --- Keep-warm (AD41): every 5 minutes one ingest and one status container log in to RDS
+    # (or confirm their connection with one round trip), so an upload never waits for a cold
+    # IAM login. Free: EventBridge schedules cost nothing and this is ~17k invocations a month.
+    # With RDS stopped, the ping fails a 3 s TCP check and returns at once.
+    KeepWarm:
+      Type: AWS::Events::Rule
+      Properties:
+        Description: Keeps the ingest and status Lambdas logged in to RDS
+        ScheduleExpression: rate(5 minutes)
+        State: ENABLED
+        Targets:
+          - Id: ingest
+            Arn: !GetAtt IngestLambdaFunction.Arn
+            Input: '{"warmup": true}'
+          - Id: status
+            Arn: !GetAtt StatusLambdaFunction.Arn
+            Input: '{"warmup": true}'
+    IngestKeepWarmInvoke:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt IngestLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt KeepWarm.Arn
+    StatusKeepWarmInvoke:
+      Type: AWS::Lambda::Permission
+      Properties:
+        FunctionName: !GetAtt StatusLambdaFunction.Arn
+        Action: lambda:InvokeFunction
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt KeepWarm.Arn
+
+    # --- One role per function, each with only what that function does ---
+    PresignRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: &lambdaTrust
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: {Service: lambda.amazonaws.com}
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: presign
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [logs:CreateLogStream, logs:PutLogEvents]
+                  Resource: !Join ['', ['arn:aws:logs:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':log-group:/aws/lambda/${self:service}-${sls:stage}-presign:*']]
+                # The browser's POST is authorised by this role's signature, for one key.
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Join ['', ['arn:aws:s3:::${self:custom.bucketName}', !Ref 'AWS::AccountId', '/uploads/*']]
+    IngestRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *lambdaTrust
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        Policies:
+          - PolicyName: ingest
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: s3:GetObject
+                  Resource: !Join ['', ['arn:aws:s3:::${self:custom.bucketName}', !Ref 'AWS::AccountId', '/uploads/*']]
+                - Effect: Allow
+                  Action: s3:PutObject
+                  Resource: !Join ['', ['arn:aws:s3:::${self:custom.bucketName}', !Ref 'AWS::AccountId', '/rejects/*']]
+                - Effect: Allow
+                  Action: rds-db:connect
+                  Resource: !Join ['', ['arn:aws:rds-db:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':dbuser:', !GetAtt Database.DbiResourceId, '/${self:custom.dbUser}']]
+                # The destinations run with the function's own role.
+                - Effect: Allow
+                  Action: lambda:InvokeFunction
+                  Resource: !Join ['', ['arn:aws:lambda:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':function:${self:service}-${sls:stage}-notify']]
+                - Effect: Allow
+                  Action: sqs:SendMessage
+                  Resource: !GetAtt IngestFailures.Arn
+    NotifyRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *lambdaTrust
+        Policies:
+          - PolicyName: notify
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: [logs:CreateLogStream, logs:PutLogEvents]
+                  Resource: !Join ['', ['arn:aws:logs:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':log-group:/aws/lambda/${self:service}-${sls:stage}-notify:*']]
+                # SecureStrings use the account's aws/ssm key, whose policy allows decryption
+                # through SSM, so no kms statement is needed.
+                - Effect: Allow
+                  Action: ssm:GetParameters  # one call for both parameters
+                  Resource:
+                    - !Join ['', ['arn:aws:ssm:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':parameter${self:custom.ssmPrefix}/tunnel-url']]
+                    - !Join ['', ['arn:aws:ssm:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':parameter${self:custom.ssmPrefix}/webhook-secret']]
+    StatusRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument: *lambdaTrust
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        Policies:
+          - PolicyName: status
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: rds-db:connect
+                  Resource: !Join ['', ['arn:aws:rds-db:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':dbuser:', !GetAtt Database.DbiResourceId, '/${self:custom.dbUser}']]
+
+  Outputs:
+    PresignUrl:
+      Value: !GetAtt PresignLambdaFunctionUrl.FunctionUrl
+    StatusUrl:
+      Value: !GetAtt StatusLambdaFunctionUrl.FunctionUrl
+    UploadBucket:
+      Value: !Ref UploadBucket
+    UploadOrigin:
+      Value: !Join ['', ['https://', !Ref UploadBucket, '.s3.', !Ref 'AWS::Region', '.amazonaws.com']]
+    DatabaseHost:
+      Value: !GetAtt Database.Endpoint.Address
+    DatabaseInstance:
+      Value: !Ref Database
+    IngestFailuresQueue:
+      Value: !Ref IngestFailures

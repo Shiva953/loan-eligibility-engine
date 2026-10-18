@@ -1,0 +1,415 @@
+{
+  "name": "C · User notification",
+  "nodes": [
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000001",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -448
+      ],
+      "parameters": {
+        "width": 1360,
+        "height": 260,
+        "content": "## C · User notification\nRuns after Workflow B has written a batch's matches (or manually, for the most recent matched batch). One database round trip when nothing is sent, plus one per email sent.\n1. **Plan notifications** (one SQL statement): read `app_config` and refuse to record anything unless `EMAIL_MODE` is `suppressed` or `test_aliases` and the cap, aliases and sender are valid; record every user with new matches. In `test_aliases` mode the first `EMAIL_CAP` users are `pending` with a test alias as recipient; everyone else is `suppressed`. With nothing pending the batch is closed here. A rerun finds them all recorded and sends nothing.\n2. **Check email settings**: the same checks again in code; stops the workflow with the reason.\n3. **Render emails** for those users only. In `suppressed` mode they are previews and stop here.\n4. **Check recipients**, then one email at a time: send through SES, record the result (the last one closes the batch), pause to stay under the SES rate.\nn8n never holds more than `EMAIL_CAP` emails, and never a user's real address."
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000002",
+      "name": "Never the CSV address",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1376,
+        -448
+      ],
+      "parameters": {
+        "width": 1120,
+        "height": 260,
+        "content": "### Who can receive an email\n* The planning query never selects `users.email`: the address from the upload cannot reach this workflow.\n* Recipients come only from `EMAIL_ALIASES`, and only in `test_aliases` mode.\n* `EMAIL_CAP` is applied twice: in the query (only that many become `pending`) and in **Check recipients**.\n* **Check recipients** stops everything unless every recipient is one of the aliases, used once, and the sender is `SES_SENDER`.\n* The SES credential is a send-only IAM user, never the owner's admin keys; the SES sandbox (verified identities only) is the second layer."
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000003",
+      "name": "Called by Workflow B",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000004",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        192
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000006",
+      "name": "Check email settings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        96
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/email_settings.js"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000007",
+      "name": "Plan notifications",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        96
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/notify/plan_notifications.sql",
+        "options": {
+          "queryReplacement": "={{ [ $('Called by Workflow B').isExecuted ? String($('Called by Workflow B').first().json.batch_id ?? '') : '', $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000008",
+      "name": "Render emails",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        96
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/render_emails.js"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000009",
+      "name": "Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        96
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0c0c0c0c-0000-4000-8000-000000000101",
+              "leftValue": "={{ $json.send === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000010",
+      "name": "Check recipients",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        0
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/recipient_check.js"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000011",
+      "name": "Loop over emails",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1568,
+        0
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": "={{ $prevNode.name === 'Check recipients' }}"
+        }
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000012",
+      "name": "Send email (AWS SES)",
+      "type": "n8n-nodes-base.awsSes",
+      "typeVersion": 1,
+      "position": [
+        1792,
+        -160
+      ],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "authentication": "iam",
+        "resource": "email",
+        "operation": "send",
+        "isBodyHtml": true,
+        "subject": "={{ $json.subject }}",
+        "body": "={{ $json.html }}",
+        "fromEmail": "={{ $json.from }}",
+        "toAddresses": "={{ [ $json.to ] }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "aws": "@@credential:aws_ses"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000013",
+      "name": "Read SES result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        -160
+      ],
+      "parameters": {
+        "jsCode": "@@include:n8n/code/ses_result.js"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000014",
+      "name": "Record result",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2240,
+        -160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "@@include:sql/notify/record_notification.sql",
+        "options": {
+          "queryReplacement": "={{ [ $json.notification_id, $json.outcome, $json.ses_message_id, $json.error, $execution.id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": "@@credential:app_postgres"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000015",
+      "name": "Pace sends",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        2464,
+        -160
+      ],
+      "parameters": {
+        "amount": "={{ $('Check email settings').first().json.pause_seconds }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "0c0c0c0c-0000-4000-8000-000000000020",
+      "name": "Done",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1792,
+        240
+      ],
+      "executeOnce": true,
+      "parameters": {},
+      "notes": "Every path ends here, so Workflow B gets C's result on its first output and goes on to the next batch.",
+      "notesInFlow": true
+    }
+  ],
+  "connections": {
+    "Called by Workflow B": {
+      "main": [
+        [
+          {
+            "node": "Plan notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Plan notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check email settings": {
+      "main": [
+        [
+          {
+            "node": "Render emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan notifications": {
+      "main": [
+        [
+          {
+            "node": "Check email settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render emails": {
+      "main": [
+        [
+          {
+            "node": "Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send?": {
+      "main": [
+        [
+          {
+            "node": "Check recipients",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check recipients": {
+      "main": [
+        [
+          {
+            "node": "Loop over emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop over emails": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send email (AWS SES)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send email (AWS SES)": {
+      "main": [
+        [
+          {
+            "node": "Read SES result",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read SES result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read SES result": {
+      "main": [
+        [
+          {
+            "node": "Record result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record result": {
+      "main": [
+        [
+          {
+            "node": "Pace sends",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pace sends": {
+      "main": [
+        [
+          {
+            "node": "Loop over emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  }
+}

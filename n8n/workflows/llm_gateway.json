@@ -1,0 +1,390 @@
+{
+  "id": "lnWfLlmGateway01",
+  "name": "LLM gateway (sub-workflow)",
+  "nodes": [
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000101",
+      "name": "About this gateway",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        -224
+      ],
+      "parameters": {
+        "width": 1088,
+        "height": 176,
+        "content": "## LLM gateway\nThe only workflow that talks to an LLM provider, so the provider can be swapped in one place (Gemini today).\n**In:** one item per request, `{ purpose, model, system, prompt, schema, temperature, max_output_tokens }`, from Workflow A (crawl-time extraction), Workflow B or the warm step (fuzzy cohorts). Several requests go out `llm_concurrency` at a time, paced under `llm_rpm`.\n**Out:** one item per request, in request order: `{ request_index, ok, data, error, calls, tokens_in, tokens_out }`, always this shape.\nGuards: the daily free-tier budget (`llm_rpd`) is checked before every call (**Load app_config** reads the switches and today's usage in one query, so a call costs two database round trips: that one and the log). 429/5xx responses back off (honouring RetryInfo) up to `llm_max_retries`. Every attempt is logged in `llm_calls`."
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000001",
+      "name": "Called by A or B",
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        304
+      ],
+      "parameters": {
+        "inputSource": "passthrough"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000002",
+      "name": "Load app_config",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        224,
+        304
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- LLM gateway, first statement: every app_config switch as one JSON object (as in\n-- sql/common/load_config.sql) and the provider requests that count against today's free-tier\n-- quota, in one round trip (docs/DECISIONS.md AD27). Gemini resets requests-per-day at midnight\n-- Pacific time, so the day is measured in that zone. Rate-limited attempts are rejected by the\n-- provider and don't consume the quota.\nSELECT (SELECT jsonb_object_agg(key, value) FROM app_config) AS config,\n       (SELECT count(*)\n        FROM llm_calls\n        WHERE outcome <> 'rate_limited'\n          AND created_at >= (date_trunc('day', now() AT TIME ZONE 'America/Los_Angeles')\n                             AT TIME ZONE 'America/Los_Angeles')) AS calls_today;\n",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      },
+      "executeOnce": true
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000004",
+      "name": "Build provider request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        304
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Build provider request\" (LLM gateway). Mode: Run Once for All Items.\n//\n// The gateway is the only place that knows a provider's wire format, so swapping Gemini for\n// another provider is a change here and in one HTTP node's credential. Callers send a\n// provider-neutral request: { purpose, model, system, prompt, schema, temperature,\n// max_output_tokens, prompt_version }.\n//\n// The daily request budget is enforced before the call. Gemini's free tier has a\n// requests-per-day cap, and spending it on a runaway loop would block the demo for the rest\n// of the day.\n//\n// A caller may send several requests at once (one item each). The HTTP node then sends them\n// concurrently, llm_concurrency at a time, and waits between those groups so the account stays\n// under llm_rpm (DECISIONS AD29). Every request is checked against the budget on its own.\n\nconst GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';\n\nfunction geminiCall(request) {\n  return {\n    url: `${GEMINI_BASE}/${encodeURIComponent(request.model)}:generateContent`,\n    body: {\n      systemInstruction: { parts: [{ text: request.system }] },\n      contents: [{ role: 'user', parts: [{ text: request.prompt }] }],\n      generationConfig: {\n        temperature: request.temperature ?? 0,\n        maxOutputTokens: request.max_output_tokens ?? 8192,\n        responseMimeType: 'application/json',\n        responseJsonSchema: request.schema,\n      },\n    },\n  };\n}\n\nfunction build(request, config, callsToday) {\n  const base = {\n    purpose: request.purpose,\n    prompt_version: request.prompt_version ?? null,\n    provider: config.llm_provider,\n    model: request.model,\n    max_retries: Number(config.llm_max_retries),\n  };\n  // Run from its own canvas the gateway has no request; say so instead of calling the provider.\n  if (!request.model || !request.prompt) {\n    return {\n      ...base,\n      within_budget: false,\n      ok: false,\n      calls: 0,\n      error: 'no request to send: the gateway is called by Workflow A, Workflow B and the warm step '\n        + '(run one of those, or pin a { purpose, model, system, prompt, schema } item on \"Called by A or B\")',\n    };\n  }\n  const budget = Number(config.llm_rpd);\n  if (callsToday >= budget) {\n    return {\n      ...base,\n      within_budget: false,\n      ok: false,\n      calls: 0,\n      error: `daily LLM budget reached: ${callsToday} of ${budget} requests used (LLM_RPD)`,\n    };\n  }\n  if (config.llm_provider !== 'gemini') {\n    // The gateway's interface is provider-neutral, but only the Gemini branch is wired so far.\n    return { ...base, within_budget: false, ok: false, calls: 0, error: `provider ${config.llm_provider} is not wired` };\n  }\n  return { ...base, within_budget: true, ...geminiCall(request) };\n}\n\n// How many requests go out together, and how long to wait between groups to respect llm_rpm.\nfunction pacing(config) {\n  const concurrency = Math.max(1, Math.floor(Number(config.llm_concurrency) || 1));\n  const rpm = Number(config.llm_rpm);\n  const interval = rpm > 0 ? Math.ceil((60000 * concurrency) / rpm) : 0;\n  return { batch_size: concurrency, batch_interval_ms: interval };\n}\n\n// ---- n8n entry point ----\nconst config = $('Load app_config').first().json.config;\nconst callsToday = Number($input.first().json.calls_today ?? 0);\nconst pace = pacing(config);\nconst sentMs = Date.now();\nreturn $('Called by A or B').all().map((item, index) => ({\n  json: { request_index: index, ...build(item.json, config, callsToday + index), ...pace, sent_ms: sentMs },\n}));\n"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000005",
+      "name": "Within daily budget?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        672,
+        304
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0d0d0d0d-0000-4000-8000-0000000000c1",
+              "leftValue": "={{ $json.within_budget }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000006",
+      "name": "Call provider",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        896,
+        208
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 180000,
+          "batching": {
+            "batch": {
+              "batchSize": "={{ $json.batch_size }}",
+              "batchInterval": "={{ $json.batch_interval_ms }}"
+            }
+          }
+        }
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "lnGeminiHeader01",
+          "name": "Gemini API key"
+        }
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000007",
+      "name": "Parse provider response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        208
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Parse provider response\" (LLM gateway). Mode: Run Once for All Items.\n//\n// Decides one of three outcomes for each provider response:\n//   * ok: valid JSON matching the schema the caller asked for;\n//   * retry: rate limited (429), server error (5xx) or network failure, while attempts remain.\n//     The wait comes from the provider's RetryInfo or Retry-After when given, otherwise it is\n//     exponential (4s, 8s, 16s ... capped at 60s);\n//   * error: anything else, or retries exhausted.\n// This node runs once per attempt (a pass over every request still in flight), so the attempt\n// number is n8n's run index + 1. Pass 0 answers what \"Within daily budget?\" let through, later\n// passes what \"Back off\" sent again; the HTTP node keeps item order, so response i belongs to\n// request i of the same pass. duration_ms runs from the pass's start to its last response.\n\nfunction retryDelaySeconds(response, attempt) {\n  const details = response.body?.error?.details ?? [];\n  const info = details.find((d) => String(d['@type'] ?? '').endsWith('RetryInfo'));\n  const fromBody = info ? parseFloat(String(info.retryDelay)) : NaN;\n  const fromHeader = parseFloat(response.headers?.['retry-after'] ?? '');\n  const hinted = Number.isFinite(fromBody) ? fromBody : fromHeader;\n  if (Number.isFinite(hinted) && hinted > 0) return Math.min(Math.ceil(hinted), 60);\n  return Math.min(2 ** (attempt + 1), 60);\n}\n\nfunction parseGemini(body) {\n  const usage = body.usageMetadata ?? {};\n  const tokens = {\n    tokens_in: usage.promptTokenCount ?? 0,\n    tokens_out: (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0),\n  };\n  if (body.promptFeedback?.blockReason) {\n    return { ...tokens, error: `prompt blocked: ${body.promptFeedback.blockReason}` };\n  }\n  const candidate = body.candidates?.[0];\n  if (!candidate) return { ...tokens, error: 'no candidates in response' };\n  if (candidate.finishReason && candidate.finishReason !== 'STOP') {\n    return { ...tokens, error: `generation stopped: ${candidate.finishReason}` };\n  }\n  const text = (candidate.content?.parts ?? []).map((part) => part.text ?? '').join('');\n  try {\n    return { ...tokens, data: JSON.parse(text) };\n  } catch (err) {\n    return { ...tokens, error: `response was not valid JSON: ${err.message}` };\n  }\n}\n\nfunction decide(request, response, attempt) {\n  const status = response.statusCode ?? 0;\n  const common = {\n    request_index: request.request_index,\n    batch_size: request.batch_size,\n    batch_interval_ms: request.batch_interval_ms,\n    purpose: request.purpose,\n    prompt_version: request.prompt_version,\n    provider: request.provider,\n    model: request.model,\n    url: request.url,\n    body: request.body,\n    max_retries: request.max_retries,\n    attempt,\n    http_status: status,\n  };\n  if (status === 200) {\n    const parsed = parseGemini(response.body ?? {});\n    if (parsed.error) return { ...common, ...parsed, ok: false, retry: false, outcome: 'error' };\n    return { ...common, ...parsed, ok: true, retry: false, outcome: 'ok', error: null };\n  }\n  const retryable = status === 0 || status === 429 || status >= 500;\n  const message =\n    response.body?.error?.message ?? response.error?.message ?? `HTTP ${status || 'request failed'}`;\n  const outcome = status === 429 ? 'rate_limited' : 'error';\n  if (retryable && attempt < request.max_retries) {\n    return {\n      ...common, ok: false, retry: true, outcome, tokens_in: 0, tokens_out: 0,\n      wait_seconds: retryDelaySeconds(response, attempt), error: message,\n    };\n  }\n  return { ...common, ok: false, retry: false, outcome, tokens_in: 0, tokens_out: 0, error: message };\n}\n\n// ---- n8n entry point ----\nconst pass = $runIndex;\nconst sent = pass === 0 ? $('Within daily budget?').all(0, 0) : $('Back off').all(0, pass - 1);\nconst now = Date.now();\nreturn $input.all().map((response, i) => {\n  const request = sent[i].json;\n  const outcome = decide(request, response.json, pass + 1);\n  return { json: { ...outcome, duration_ms: Math.max(0, now - (request.sent_ms ?? now)) } };\n});\n"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000008",
+      "name": "Log LLM call",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1344,
+        208
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- LLM gateway: record one provider request.\n-- Parameters: #1 execution id, #2 purpose, #3 provider, #4 model, #5 attempt, #6 http status,\n--             #7 outcome, #8 tokens in, #9 tokens out, #10 duration ms, #11 error\nINSERT INTO llm_calls (execution_id, purpose, provider, model, attempt, http_status, outcome,\n                       tokens_in, tokens_out, duration_ms, error)\nVALUES ($1, $2, $3, $4, $5::smallint, $6::integer, $7, $8::integer, $9::integer,\n        $10::integer, $11)\nRETURNING call_id;\n",
+        "options": {
+          "queryReplacement": "={{ [ $execution.id, $json.purpose, $json.provider, $json.model, $json.attempt, $json.http_status || null, $json.outcome, $json.tokens_in, $json.tokens_out, $json.duration_ms, $json.ok ? null : $json.error ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "lnAppPostgres001",
+          "name": "App DB (n8n_app)"
+        }
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000009",
+      "name": "Restore response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        208
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Restore response\" (LLM gateway). Mode: Run Once for All Items.\n//\n// \"Log LLM call\" is a Postgres node, so its output is the inserted rows. This puts the parsed\n// provider responses back on the main path for the retry decision. $('…').all() returns the\n// latest run, which is the pass just logged. Requests to retry wait together (one Wait node),\n// as long as the longest delay any of them was given, and their next pass starts after it.\n\nconst items = $('Parse provider response').all().map((item) => item.json);\nconst wait = Math.max(0, ...items.filter((item) => item.retry).map((item) => item.wait_seconds ?? 0));\nconst resend = Date.now() + wait * 1000;\nreturn items.map((item) => ({ json: item.retry ? { ...item, wait_seconds: wait, sent_ms: resend } : item }));\n"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000010",
+      "name": "Retry?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1792,
+        208
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0d0d0d0d-0000-4000-8000-0000000000c2",
+              "leftValue": "={{ $json.retry }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000011",
+      "name": "Back off",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1792,
+        0
+      ],
+      "webhookId": "0d0d0d0d-0000-4000-8000-0000000000d1",
+      "parameters": {
+        "amount": "={{ $json.wait_seconds }}",
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "0d0d0d0d-0000-4000-8000-000000000012",
+      "name": "Return result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2016,
+        400
+      ],
+      "parameters": {
+        "jsCode": "// Code node \"Return result\" (LLM gateway). Mode: Run Once for All Items.\n//\n// The gateway's only output: one item per request, in request order, in the same shape\n// whether the call succeeded, failed or was refused by the budget guard. Callers branch on `ok`,\n// and record `calls` and the tokens in their own metrics. The request URL and body never leave\n// the gateway.\n//\n// A request ends either at \"Within daily budget?\" (refused) or at \"Retry?\" (answered, or out of\n// retries), in whichever pass it finished. This node runs once for each pass that finished\n// something, and n8n hands the caller only its last run, so every run reads all of them.\n\nconst MAX_PASSES = 20;\n\nfunction result(item) {\n  return {\n    request_index: item.request_index ?? 0,\n    ok: item.ok === true,\n    data: item.ok === true ? item.data : null,\n    error: item.ok === true ? null : item.error ?? 'unknown error',\n    purpose: item.purpose,\n    prompt_version: item.prompt_version ?? null,\n    provider: item.provider,\n    model: item.model,\n    calls: item.attempt ?? item.calls ?? 0,\n    tokens_in: item.tokens_in ?? 0,\n    tokens_out: item.tokens_out ?? 0,\n  };\n}\n\n// Items one node put on one branch in one run; null once that run doesn't exist.\nfunction ended(node, branch, run) {\n  try {\n    return $(node).all(branch, run).map((item) => item.json);\n  } catch (error) {\n    return /not found|hasn't been executed/.test(String(error?.message)) ? null : [];\n  }\n}\n\nfunction finished() {\n  const byRequest = new Map();\n  for (const item of ended('Within daily budget?', 1, 0) ?? []) byRequest.set(item.request_index, item);\n  for (let run = 0; run < MAX_PASSES; run += 1) {\n    const items = ended('Retry?', 1, run);\n    if (items === null) break;\n    for (const item of items) byRequest.set(item.request_index, item);\n  }\n  return [...byRequest.values()].sort((a, b) => (a.request_index ?? 0) - (b.request_index ?? 0));\n}\n\n// ---- n8n entry point ----\nreturn finished().map((item) => ({ json: result(item) }));\n"
+      }
+    }
+  ],
+  "connections": {
+    "Called by A or B": {
+      "main": [
+        [
+          {
+            "node": "Load app_config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load app_config": {
+      "main": [
+        [
+          {
+            "node": "Build provider request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build provider request": {
+      "main": [
+        [
+          {
+            "node": "Within daily budget?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Within daily budget?": {
+      "main": [
+        [
+          {
+            "node": "Call provider",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call provider": {
+      "main": [
+        [
+          {
+            "node": "Parse provider response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse provider response": {
+      "main": [
+        [
+          {
+            "node": "Log LLM call",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log LLM call": {
+      "main": [
+        [
+          {
+            "node": "Restore response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Restore response": {
+      "main": [
+        [
+          {
+            "node": "Retry?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry?": {
+      "main": [
+        [
+          {
+            "node": "Back off",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Return result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Back off": {
+      "main": [
+        [
+          {
+            "node": "Call provider",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "callerPolicy": "workflowsFromSameOwner",
+    "binaryMode": "separate"
+  },
+  "active": false,
+  "pinData": {}
+}

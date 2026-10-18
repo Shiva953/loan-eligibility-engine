@@ -1,0 +1,111 @@
+{
+  "pool_rows": 50380,
+  "strategy_drops": 8143,
+  "oracle_verdicts": {
+    "ineligible": 41,
+    "uncertain": 27,
+    "eligible": 32
+  },
+  "strata": {
+    "dropped": {
+      "pairs": 40,
+      "threshold_k25": {
+        "false_drops": 0,
+        "missed_drops": 20,
+        "agree": 20,
+        "compared": 40
+      },
+      "compile3": {
+        "false_drops": 0,
+        "missed_drops": 20,
+        "agree": 20,
+        "compared": 40
+      },
+      "with_rule_veto": {
+        "false_drops": 0,
+        "missed_drops": 0,
+        "agree": 40,
+        "compared": 40
+      },
+      "oracle_rejects": 40,
+      "oracle_by_criterion": {
+        "Salaried applicants with a stable, regular month": {
+          "ineligible": 20
+        },
+        "Minimum credit score stated as 720 (extraction c": {
+          "ineligible": 20
+        }
+      }
+    },
+    "kept": {
+      "pairs": 60,
+      "threshold_k25": {
+        "false_drops": 0,
+        "missed_drops": 1,
+        "agree": 59,
+        "compared": 60
+      },
+      "compile3": {
+        "false_drops": 0,
+        "missed_drops": 1,
+        "agree": 59,
+        "compared": 60
+      },
+      "with_rule_veto": {
+        "false_drops": 0,
+        "missed_drops": 1,
+        "agree": 59,
+        "compared": 60
+      },
+      "oracle_rejects": 1,
+      "oracle_by_criterion": {
+        "Self-employed professionals such as doctors, cha": {
+          "uncertain": 8
+        },
+        "High-income individuals": {
+          "eligible": 8
+        },
+        "Salaried applicants with a stable, regular month": {
+          "eligible": 4
+        },
+        "Applicants with a good credit history": {
+          "eligible": 4
+        },
+        "Borrowers with an excellent repayment track reco": {
+          "uncertain": 4
+        },
+        "Applicants whose income comfortably exceeds the ": {
+          "uncertain": 4
+        },
+        "Senior salaried employees with a strong credit p": {
+          "uncertain": 4
+        },
+        "Young professionals at the start of their career": {
+          "eligible": 4,
+          "uncertain": 3,
+          "ineligible": 1
+        },
+        "Minimum credit score stated as 720 (extraction c": {
+          "eligible": 4
+        },
+        "Applicants who are not close to retirement age": {
+          "eligible": 3,
+          "uncertain": 1
+        },
+        "Mid-career salaried professionals": {
+          "eligible": 3,
+          "uncertain": 1
+        },
+        "Business owners and self-employed non-profession": {
+          "uncertain": 2,
+          "eligible": 2
+        }
+      }
+    }
+  },
+  "estimates": {
+    "drop_precision": 1.0,
+    "missed_rejection_rate_in_keeps": 0.017,
+    "drop_recall": 0.92
+  }
+}

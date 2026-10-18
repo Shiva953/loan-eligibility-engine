@@ -1,0 +1,26 @@
+user_id,name,email,monthly_income,credit_score,employment_status,age
+8e7aa6e9-9f19-4504-99dd-251de5121482,Ankit Rathore,ankit.rathore@example.com,27000,800,Business,44
+14aa4e71-9d3c-4dec-80a6-1f933d6c51e3,Pari Khanna,pari.khanna@example.com,147000,725,Salaried,44
+65b00a2d-35d1-4880-9071-950eadec6f11,Sai Soni,sai.soni@example.com,66000,725,Business,26
+8eb5140f-16f4-4881-9724-1955b91dddd9,Ishaan Chatterjee,ishaan.chatterjee@example.com,116000,665,Self-Employed,32
+b5fb12e0-d909-4b89-8655-50964f1a8a1d,Ishan Soni,ishan.soni@example.com,105000,670,Self-Employed,24
+7f9ac098-8df0-4f25-95f1-9a51e41686cd,Dhruv Menon,dhruv.menon@example.com,148000,695,Business,47
+d82fb0f1-4236-44a6-864f-a3f3eab06e9b,Kavya Kumar,kavya.kumar@example.com,96000,695,Self-Employed,33
+2106119e-c40d-41b5-b97a-762393550840,Aisha Mehta,aisha.mehta@example.com,119000,695,Salaried,38
+d9814559-3a9a-4a39-a261-e34a7b6bc3c6,Pooja Thakur,pooja.thakur@example.com,71000,700,Self-Employed,26
+4ec0a954-ff8b-4a6a-ab74-fe5766eebc57,Pari Shaikh,pari.shaikh@example.com,56000,710,Salaried,43
+025ff87c-44df-4a13-94f3-98ee4b5c1a95,Diya Agarwal,diya.agarwal@example.com,130000,730,Self-Employed,28
+42969a50-3328-4e16-abe8-0fa95c24c1ae,Aarav Mishra,aarav.mishra@example.com,115000,755,Self-Employed,34
+d4d6d278-089b-4123-a842-997da9f5307c,Imran Desai,imran.desai@example.com,84000,710,Salaried,36
+f71bd135-ec06-43b1-b3f2-9c6a4242c225,Amit Bhatt,amit.bhatt@example.com,48000,785,Business,49
+bf5f85e2-31d0-4d9c-98be-e0745ec0c260,Reyansh Ansari,reyansh.ansari@example.com,135000,690,Business,34
+eea33d4e-8bed-4b65-94a4-d29c7383d496,Ishan Patel,ishan.patel@example.com,47000,735,Salaried,43
+44becdce-f4d4-45ec-8be4-0e7fc07991d4,Navya Banerjee,navya.banerjee@example.com,62000,675,Business,39
+dc56dc87-f32e-4a03-ad1b-a5c8c4ffc64e,Riya Iyengar,riya.iyengar@example.com,141000,735,Salaried,32
+e0412118-991f-47c9-b551-abfd219763c5,Kabir Biswas,kabir.biswas@example.com,90000,755,Self-Employed,27
+96060250-ea3e-4f73-884c-1884c88f63d6,Ayaan Rathore,ayaan.rathore@example.com,147000,730,Business,43
+039e257a-6041-410e-b25a-bdecce918208,Ananya Mukherjee,ananya.mukherjee@example.com,103000,655,Salaried,49
+069a306f-f1f0-4f49-8500-29abef3e4144,Karan Mehta,karan.mehta@example.com,34000,735,Self-Employed,27
+7f60b9fa-1f12-4a78-a9f9-14845377899a,Vihaan Patel,vihaan.patel@example.com,83000,725,Salaried,34
+561f8bfe-9f93-493f-af00-e7c434fd02f6,Prakash Verma,prakash.verma@example.com,149000,760,Business,48
+ebe48123-a5b0-4526-b20b-e3f808be3b07,Siya Singh,siya.singh@example.com,49000,670,Self-Employed,31

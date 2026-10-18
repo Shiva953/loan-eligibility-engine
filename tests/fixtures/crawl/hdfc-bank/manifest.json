@@ -1,0 +1,20 @@
+{
+  "entries": [
+    {
+      "file": "robots.txt",
+      "url": "https://www.hdfc.bank.in/robots.txt",
+      "status": 200,
+      "bytes": 6513,
+      "sha256": "d0b72cc34687c3cc1fc9eb11d4a16f0d3384824c6877845f7dd90cc94d967acb",
+      "fetched_at": "2026-10-16T10:10:45+00:00"
+    },
+    {
+      "file": "eligibility-criteria.html",
+      "url": "https://www.hdfc.bank.in/personal-loan/eligibility-criteria",
+      "status": 200,
+      "bytes": 1101693,
+      "sha256": "b9427f4f23545d02e7632411ea86e33c36067d36dfa2fdbb65337554f584c123",
+      "fetched_at": "2026-10-16T10:10:51+00:00"
+    }
+  ]
+}
