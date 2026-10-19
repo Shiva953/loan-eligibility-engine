@@ -1,5 +1,10 @@
 # Loan Eligibility Engine
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/banner-dark.png">
+  <img src="docs/banner.png" width="100%" alt="Architecture: the browser gets a presigned POST and uploads the CSV to S3; an ingest Lambda in the VPC loads it into RDS Postgres; notify sends a signed webhook through a tunnel to n8n, where Workflow B matches and Workflow C emails through SES; Workflow A crawls lender pages and an LLM gateway calls Gemini. 2,40,000 possible checks become 0 AI calls per upload.">
+</picture>
+
 Upload a CSV of customers and the system works out which personal loans each of them is likely
 eligible for, using the criteria lenders publish on their own websites, then emails the people
 who have a match.
