@@ -136,7 +136,7 @@ n8n 2.x specifics I'm relying on:
 - `docs/EXPERIMENTS.md`, and a demo recording plan kept out of git (`build/demo-script.md`).
 - The private GitHub repo and collaborator invites, which I'll ask about first.
 
-- **Status 2026-10-18 (review):** written: the README (diagram, setup, credentials, the optimisation, design decisions), `docs/architecture.{mmd,png}`, and a local demo plan in `build/demo-script.md` (not in git). `make demo-reset` sets up each workflow's full path (DECISIONS AD39). The video and the repo invites are left for the owner.
+- **Status 2026-10-18 (review):** written: the README (diagram, setup, credentials, the optimisation, design decisions), `docs/architecture.{mmd,png}`, and a local demo plan in `build/demo-script.md` (not in git). `make demo-reset` sets up each workflow's full path (DECISIONS AD39). The demo video and its five source clips are linked at the top of the README; the repo invites are left for the owner.
 
 ## 6. What gets cut, in order, if time runs short
 1. The E1 extras: the CSS/regex/hybrid strategy, separate worktrees, the two-pass variant.

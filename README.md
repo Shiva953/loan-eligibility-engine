@@ -17,8 +17,35 @@ down to a single question for the LLM. That question is answered right after the
 an upload makes no LLM calls at all. Matches agree with a brute-force check of every pair at 1k,
 10k and 100k users.
 
-> **Demo video (5–10 min):** _link to be added_
-<!-- Paste the link here, e.g. [Watch the demo](https://...) -->
+## Demo video
+
+**[Watch the full demo](https://drive.google.com/file/d/1qsIigkDdpJJgSd1ztAXSMapAdR7U-8UC/view?usp=sharing)** (9 min 44 s)
+
+| Starts at | Part |
+|---|---|
+| 0:00 | The problem: 2,40,000 possible checks, and why an upload needs 0 AI calls |
+| 0:38 | The upload page |
+| 0:54 | Architecture |
+| 1:37 | Event-driven ingestion: presigned upload, one SQL statement, duplicates and failures |
+| 2:14 | Workflow A, loan product discovery: how it crawls and extracts |
+| 2:50 | Workflow A live in n8n, then the warm step |
+| 3:59 | The LLM gateway |
+| 4:17 | The optimisation treasure hunt: funnel, cohorts, two judges, warming, the oracle, scaling |
+| 6:34 | Workflow B, user-loan matching: the design, then a live run through the LLM branch |
+| 7:37 | Workflow C, user notification: the design, then the live run and the SES sends |
+| 8:16 | The whole pipeline, live on AWS: `users.csv` uploaded, the funnel, the B and C runs |
+| 9:03 | The email received in the test inbox |
+| 9:20 | The engine, measured |
+
+The live footage in the demo comes from these five recordings, linked here for reference:
+
+1. [01 · Opening](https://drive.google.com/file/d/1KrckeEAZKq_fdv4llOZ0cupT43UFtKgs/view?usp=sharing): the live upload page, connected to AWS
+2. [02 · Workflow A](https://drive.google.com/file/d/1lSw08UjPGzfqIatd2oUKUruNB_QbbfEL/view?usp=sharing): a crawl run, with the unchanged-page skip, LLM extraction and the warm step
+3. [03 · Workflows B and C](https://drive.google.com/file/d/1XjSdmAUP8gOaMQrKYykILC1QWnR1rLAY/view?usp=sharing): every branch of B, the LLM path included, then C
+4. [04 · End to end on AWS](https://drive.google.com/file/d/1ihUo8At-k8U36XBNKOnuBH5JdYchwEyn/view?usp=sharing): `users.csv` uploaded, the funnel, then the B and C runs it started
+5. [05 · The email](https://drive.google.com/file/d/1H2QCKUeNslkLglgvnKiiLwyzZR7It7EB/view?usp=sharing): the message received in the test inbox
+
+## The brief
 
 | Brief ([docs/ASSIGNMENT.md](docs/ASSIGNMENT.md)) | Where it lives |
 |---|---|
@@ -31,9 +58,142 @@ an upload makes no LLM calls at all. Matches agree with a brute-force check of e
 
 ## 1. Architecture
 
-![Architecture](docs/architecture.png)
+The diagrams in this README are Mermaid. On GitHub, hover over one for zoom, pan and
+full-screen controls.
+
+```mermaid
+flowchart TD
+    U(["Browser · upload page"])
+    subgraph AWS["AWS · infra/serverless.yml"]
+        P["presign λ"]
+        S3[("S3 bucket")]
+        I["ingest λ"]
+        N["notify λ"]
+        ST["status λ"]
+        DB[("RDS Postgres")]
+        SES["SES"]
+    end
+    subgraph N8N["n8n · docker-compose.yml"]
+        GW["tunnel + nginx<br/>one webhook path"]
+        B["B · matching"]
+        C["C · notification"]
+        A["A · crawler, daily"]
+        G["LLM gateway"]
+    end
+    subgraph EXT["outside services"]
+        WEB(["lender pages"])
+        GEM(["Gemini"])
+    end
+    U -->|"1 · presign"| P
+    U -->|"2 · upload"| S3
+    S3 -->|"3 · event"| I
+    I --> DB
+    I -->|"4 · onSuccess"| N
+    N -->|"5 · signed webhook"| GW
+    GW --> B
+    B -->|"6"| C
+    C -->|"7 · email"| SES
+    U -.->|"poll"| ST
+    ST --> DB
+    B --> DB
+    A --> DB
+    A --> G
+    B --> G
+    A --> WEB
+    G --> GEM
+```
+
+<details>
+<summary>Every resource and connection, in one detailed diagram (also as <a href="docs/architecture.png">a static image</a>)</summary>
+
+```mermaid
+flowchart TB
+  user(["Browser · upload page (Next.js)"]):::ext
+
+  subgraph AWS["AWS (Sydney)"]
+    presign["presign λ · Function URL<br/>one-time POST policy"]
+    s3[("S3 bucket<br/>uploads/ · rejects/")]
+    notify["notify λ<br/>signs an HS256 JWT"]
+    ssm[["SSM SecureString<br/>tunnel URL · webhook secret"]]
+    dlq[["SQS dead-letter queue"]]
+    subgraph VPC["VPC · no NAT"]
+      ingest["ingest λ<br/>COPY + one SQL statement"]
+      status["status λ · Function URL"]
+      rds[("RDS Postgres 17 · db.t4g.micro<br/>users · loan_products · user_matches · notifications")]
+    end
+    ses["SES · sandbox"]
+  end
+
+  subgraph COMPOSE["Docker Compose · self-hosted"]
+    cf["cloudflared · quick tunnel"]
+    gw["webhook-gw (nginx)<br/>only POST /webhook/loan-match"]
+    subgraph N8N["n8n 2.43.6 + task runner"]
+      B["B · user-loan matching<br/>webhook · sweeper · manual"]
+      C["C · notification"]
+      A["A · product discovery<br/>daily 06:00"]
+      W["Warm match cache"]
+      G["LLM gateway"]
+    end
+  end
+
+  subgraph EXT["Outside services"]
+    sites(["Lender pages<br/>BankBazaar · HDFC · Kotak"]):::ext
+    gemini(["Gemini API"]):::ext
+    inbox(["Test inboxes<br/>+1 / +2 aliases"]):::ext
+  end
+
+  user -- "1 · presign" --> presign
+  user -- "2 · POST file, gzip" --> s3
+  user -. "5 · poll status" .-> status
+  s3 -- "3 · ObjectCreated" --> ingest
+  ingest -- "IAM token, TLS" --> rds
+  status --> rds
+  ingest -- "onSuccess" --> notify
+  ingest -. "onFailure" .-> dlq
+  notify --> ssm
+  notify -- "4 · signed webhook" --> cf --> gw --> B
+  B -- "6 · then" --> C
+  N8N == "set-based SQL as n8n_app, verified TLS" ==> rds
+  C -- "SendEmail, ≤ 2 per run" --> ses --> inbox
+  A --> W
+  A --> G
+  W --> G
+  B --> G
+  A -- "robots.txt, fetch" --> sites
+  G --> gemini
+
+  classDef ext fill:#f6f8fd,stroke:#c9d2ec,color:#0b1533
+```
+
+</details>
 
 What happens to one upload:
+
+```mermaid
+%%{init: {"sequence": {"actorMargin": 12, "width": 96, "boxMargin": 6, "noteMargin": 6, "messageMargin": 30}}}%%
+sequenceDiagram
+    autonumber
+    actor U as Browser
+    participant P as presign λ
+    participant S3
+    participant I as ingest λ
+    participant DB as RDS
+    participant N as notify λ
+    participant W as n8n
+    participant SES
+    U->>P: name, size
+    P-->>U: POST policy
+    U->>S3: file (gzip)
+    S3-)I: ObjectCreated
+    I->>DB: COPY + 1 SQL
+    I-)N: batch counts
+    N->>W: signed webhook
+    W-->>N: 202
+    W->>DB: B: claim, write
+    W->>DB: C: plan emails
+    W->>SES: ≤ 2 emails
+    Note over U,DB: the page polls the status λ (one query per poll)
+```
 
 1. The page asks the **presign** Lambda for a one-time S3 POST policy. The policy fixes the key,
    the content type and a 50 MB limit, and it expires in 5 minutes. The browser gzips the CSV and
@@ -77,6 +237,20 @@ one place, `AWS_REGION` ([DECISIONS AD27](docs/DECISIONS.md)).
 
 ## 2. The optimisation treasure hunt
 
+The whole funnel for the 10,000-row sample, then each stage in detail:
+
+```mermaid
+flowchart TD
+    S0["<b>S0 · every pair</b><br/>10,000 users × 24 products = 2,40,000"] -->|"one SQL join on the stated thresholds"| S2["<b>S2 · pass the hard rules</b><br/>61,937 pairs"]
+    S2 -->|"only products with a fuzzy criterion"| R["<b>pending questions</b><br/>1,840"]
+    R -->|"collapse to criterion + band"| S3["<b>S3 · cohorts</b><br/>1"]
+    S3 --> S4{"<b>S4</b> · cached?"}
+    S4 -->|"yes"| Z["<b>0 LLM calls</b> at upload time"]
+    S4 -->|"no: a new wording"| S5["<b>S5</b> · up to 25 cohorts per request<br/>+ one rule compile · 2 calls, once"]
+    S5 --> K[("llm_decisions · criterion_rules")]
+    K --> Z
+```
+
 ### The cost of the naive approach
 
 Each user $u$ has facts $x_u$ = (income, credit score, age, employment). Each of the $M$ active
@@ -109,6 +283,19 @@ users in and 2.4M items out.
 
 $$R = \{(u,p,f) : (u,p) \in Q,\ f \in F_p\}$$
 
+S3 on the sample data:
+
+```mermaid
+flowchart TD
+    subgraph P["1,840 pending questions"]
+        a["user 1: ₹82k, 760, Salaried, 29"]
+        b["user 2: ₹1.1L, 790, Salaried, 41"]
+        d["… 1,838 more"]
+    end
+    P -->|"HDFC's employer rule depends on employment only;<br/>income, score and age are inside HDFC's own limits"| K["<b>one cohort</b><br/>HDFC employer rule + Salaried"]
+    K --> Q["one question to the LLM,<br/>cached for every later batch"]
+```
+
 **S3: cohorts.** A fuzzy criterion only sees the facts it depends on, so each question maps to a
 cohort:
 
@@ -127,6 +314,19 @@ synthetic stress-test products it is 19 cohorts at 1k, 10k and 100k users alike.
 
 **S4: cache.** Each verdict is stored once per $(\kappa, \text{band})$ in `llm_decisions` and
 reused from then on.
+
+S5's two judges, and how their votes combine:
+
+```mermaid
+flowchart TD
+    P["a pair that needs judgement<br/>on fuzzy criterion f"] --> CJ["<b>cohort judge</b><br/>cached verdict c for the cohort"]
+    P --> RJ["<b>rule judge</b><br/>compiled clauses on the exact facts → r"]
+    CJ --> V{"vote"}
+    RJ --> V
+    V -->|"no rule, or r = c"| A["v = c"]
+    V -->|"c = uncertain and r = ineligible"| B["v = ineligible<br/>(the rule vetoes)"]
+    V -->|"any other disagreement"| U["v = uncertain<br/>kept as 'may qualify'"]
+```
 
 **S5: batched calls, two judges.** Each request carries up to $K = 25$ cohorts. A second judge
 compiles each criterion once into clauses over the exact facts. For a criterion with cohort
@@ -147,6 +347,27 @@ $$\text{calls} = \left\lceil \frac{U}{K} \right\rceil + \left\lceil \frac{V}{25}
 
 where $U$ is the number of uncached cohorts and $V$ the number of criteria without a compiled
 rule.
+
+Warming, in time:
+
+```mermaid
+%%{init: {"sequence": {"actorMargin": 12, "width": 96, "boxMargin": 6, "noteMargin": 6, "messageMargin": 30}}}%%
+sequenceDiagram
+    participant A as Workflow A
+    participant W as Warm step
+    participant G as LLM gateway
+    participant DB as Postgres
+    participant B as Workflow B
+    A->>DB: upsert changed products
+    A->>W: call after the crawl
+    W->>DB: unjudged cohorts?
+    W->>G: ≤ 25 cohorts / request
+    G-->>W: verdicts + rules
+    W->>DB: store them
+    Note over B,DB: later, every upload
+    B->>DB: claim: 0 uncached
+    B->>DB: write: 0 LLM calls
+```
 
 **Warming.** `cohort_space()` lists every cohort the active products could produce, from the
 products alone. Workflow A ends by judging those through the warm sub-workflow, so by the time a
@@ -234,6 +455,26 @@ throughout:
 - No node ever holds users or pairs, only cohorts, LLM requests or emails.
 - Every workflow is safe to re-run.
 
+```mermaid
+flowchart TD
+    T1(["Daily at 06:00"]) --> CFG["Load app_config"]
+    T2(["Run manually"]) --> CFG
+    CFG --> SRC["Load sources"] --> LOOP{{"Loop over sources"}}
+    LOOP -->|"next source"| RUN["Start crawl run"] --> ROB["Fetch robots.txt"] --> PLAN["Plan page fetches<br/>robots.txt check in code"]
+    PLAN -->|"allowed"| FETCH["Fetch pages<br/>honest User-Agent"] --> COL["Collect pages<br/>every page 200?"]
+    COL --> CLEAN["Clean page text<br/>table rows kept as cell · cell"] --> HASH["Hash page text<br/>SHA-256"] --> CH{"Page changed?"}
+    CH -->|"no"| UNCH["Mark unchanged<br/><b>0 LLM calls</b>"]
+    CH -->|"yes"| EXT["Extract with LLM<br/>gateway, strict JSON schema"] --> VAL["Validate products<br/>code decides what filters"] --> UPS["Upsert products<br/>+ criteria history diff"]
+    UNCH --> FIN["Finish crawl run"]
+    UPS --> FIN
+    PLAN -.->|"disallowed or error"| FIN
+    COL -.->|"a page not 200"| FIN
+    EXT -.->|"LLM failed"| FIN
+    VAL -.->|"validation error"| FIN
+    FIN --> PAUSE["Polite pause<br/>live mode only"] --> LOOP
+    LOOP -->|"all sources done"| STALE["Deactivate stale products<br/>unseen for 7 days"] --> SUM["Crawl summary"] --> WARM["Warm match cache"]
+```
+
 **A · Loan product discovery** runs daily at 06:00 and loops over the sources:
 
 1. Read robots.txt and check each URL against it.
@@ -264,6 +505,27 @@ How the crawl works:
   through the same HTTP nodes, so tests and demos don't depend on live sites. `live` crawls
   the real pages.
 
+```mermaid
+flowchart TD
+    WH(["Signed webhook<br/>JWT checked, 202 at once"]) --> TOK["Read token claims<br/>trust the claims, never the body"] --> LOOP
+    SW(["Sweeper · every 10 min"]) --> FIND["Find waiting batches"]
+    MAN(["Run manually"]) --> FIND
+    FIND --> ANY{"Anything waiting?"}
+    ANY -->|"no"| NONE["Nothing waiting"]
+    ANY -->|"yes"| LOOP{{"Loop over batches"}}
+    LOOP -->|"next batch"| CLAIM["<b>Claim batch</b> · 1 SQL statement<br/>claim + config + uncached cohorts"]
+    CLAIM --> OK{"Claimed?"}
+    OK -->|"no, already taken"| NEXT["Next batch"]
+    OK -->|"yes"| LLM{"LLM needed?"}
+    LLM -->|"no: warm cache"| WRITE
+    LLM -->|"yes"| BUILD["Build cohort requests<br/>up to 25 per request"] --> JUDGE["Judge cohorts<br/>LLM gateway"] --> STORE["Collect + store verdicts"] --> WRITE
+    WRITE["<b>Write matches</b> · 1 SQL statement<br/>every pair once, with its status + metrics"] --> NOTIFY["Notify users<br/>Workflow C"] --> NEXT
+    NEXT --> LOOP
+    CLAIM -.->|"error"| FAIL["Mark batch failed<br/>reason shown on the page"]
+    WRITE -.->|"error"| FAIL
+    FAIL --> NEXT
+```
+
 **B · User-loan matching** has three triggers that share one path: the signed webhook, a
 sweeper every 10 minutes and a manual run.
 
@@ -279,6 +541,18 @@ sweeper every 10 minutes and a manual run.
 
 A failure marks the batch failed with its reason, and the page shows that reason.
 
+```mermaid
+flowchart TD
+    T(["Called by Workflow B"]) --> PLAN
+    M(["Run manually"]) --> PLAN
+    PLAN["<b>Plan notifications</b> · 1 SQL statement<br/>refuse unsafe settings · record every user ·<br/>build at most EMAIL_CAP emails · never reads users.email"] --> CHK["Check email settings<br/>same rules again, in code"]
+    CHK --> REN["Render emails<br/>HTML + text, escaped"] --> SEND{"Send?"}
+    SEND -->|"suppressed, or nothing new"| DONE["Done"]
+    SEND -->|"test_aliases"| REC["Check recipients<br/>alias · used once · cap · sender"] --> LOOP{{"Loop over emails"}}
+    LOOP -->|"next email"| SES["Send email<br/>AWS SES node, send-only key"] --> RES["Read SES result"] --> RECD["Record result"] --> PACE["Pace sends<br/>SES rate"] --> LOOP
+    LOOP -->|"all sent"| DONE
+```
+
 **C · User notification**:
 
 1. **Plan notifications.** One statement refuses to do anything unless the email settings are
@@ -292,6 +566,15 @@ A failure marks the batch failed with its reason, and the page shows that reason
 
 A rerun sends nothing.
 
+```mermaid
+flowchart TD
+    IN(["requests from A, B or the warm step"]) --> CFG["Load app_config + today's usage"] --> BLD["Build provider request"] --> BUD{"Within daily budget?"}
+    BUD -->|"no"| RET["Return result<br/>the same shape for every request"]
+    BUD -->|"yes"| CALL["Call provider<br/>llm_concurrency at a time, paced under llm_rpm"] --> PARSE["Parse response"] --> LOG["Log LLM call"] --> RST["Restore response"] --> RTY{"Retry? 429 or 5xx"}
+    RTY -->|"yes"| BACK["Back off<br/>RetryInfo, else exponential"] --> CALL
+    RTY -->|"no"| RET
+```
+
 **LLM gateway** is a sub-workflow and the only place that calls a model.
 
 - It returns the same shape for every request.
@@ -299,9 +582,46 @@ A rerun sends nothing.
 - It sends requests in parallel, paced under the RPM limit.
 - It retries 429 and 5xx responses with backoff and logs every attempt.
 
+```mermaid
+flowchart TD
+    A(["Called by A after each crawl"]) --> FIND["Find unjudged cohorts<br/>cohort_space() minus cache"] --> N{"LLM needed?"}
+    N -->|"no"| NO["Nothing to judge<br/>one 6 ms query"]
+    N -->|"yes"| BLD["Build cohort requests"] --> G["Judge cohorts · LLM gateway"] --> ST["Store verdicts + rules"]
+```
+
 **Warm match cache** is one query plus the same nodes B uses to judge cohorts.
 
 ## 4. Ingestion
+
+A batch's life, as the status page reports it:
+
+```mermaid
+stateDiagram-v2
+    [*] --> uploaded: file lands in S3
+    uploaded --> ingested: ingest λ, COPY + 1 SQL statement
+    uploaded --> failed: file can't be read (reason kept)
+    ingested --> matching: B claims it (webhook or sweeper)
+    matching --> matched: Write matches
+    matched --> notifying: C has emails to send
+    matched --> notified: nothing to send
+    notifying --> notified: last email recorded
+    matching --> failed: error (reason kept)
+    notified --> [*]
+    failed --> [*]
+```
+
+Inside the ingest Lambda:
+
+```mermaid
+flowchart TD
+    EV(["S3 ObjectCreated"]) --> LOGIN["IAM login to RDS<br/>hedged, kept warm every 5 min"] --> DUP{"bucket + key + etag<br/>seen before?"}
+    DUP -->|"yes: redelivery"| SKIP["do nothing<br/>notify skips it"]
+    DUP -->|"no"| STREAM["Stream the object<br/>gunzip if the page compressed it"] --> HDR{"readable, with<br/>all 7 columns?"}
+    HDR -->|"no"| FAILB["failed batch<br/>with a reason the page shows"]
+    HDR -->|"yes"| COPY["COPY raw text into a temp table"] --> SQL["<b>One SQL statement</b><br/>validate every row · last user_id wins ·<br/>upsert users · close the batch"]
+    SQL --> REJ["rejects/batch.csv<br/>line · reason · raw values"]
+    SQL --> OUT["counts → notify λ<br/>via Lambda Destination"]
+```
 
 | Concern | Handling |
 |---|---|
@@ -321,6 +641,22 @@ The rejection reasons are checked against an independent Python validator: on a 
 You need Docker, [uv](https://docs.astral.sh/uv/), Node 24 and make. For AWS you also need the
 AWS CLI and a free Serverless Framework v4 login. The file avoids v4-only syntax, so
 [osls](https://github.com/oss-serverless/osls) can deploy it too.
+
+The local stack:
+
+```mermaid
+flowchart LR
+    subgraph DC["docker compose · ports bound to 127.0.0.1"]
+        N8N["n8n 2.43.6<br/>editor on :5678"] <--> RUN["n8n-runners<br/>Code nodes"]
+        N8N --> NDB[("n8n-db<br/>workflows, executions")]
+        N8N --> ADB[("app-db<br/>local Postgres :5433")]
+        N8N --> FX["fixtures<br/>saved lender pages"]
+        GW["webhook-gw · nginx<br/>only POST /webhook/loan-match"] --> N8N
+        CF["cloudflared<br/>quick tunnel"] --> GW
+    end
+    NL(["notify λ on AWS"]) --> CF
+    N8N -.->|"make use-rds"| RDS[("RDS Postgres")]
+```
 
 ### Run locally
 
